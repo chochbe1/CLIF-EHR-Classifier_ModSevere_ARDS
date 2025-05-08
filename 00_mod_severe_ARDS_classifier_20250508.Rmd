@@ -1,0 +1,1456 @@
+---
+title: "cohort_identification_ards_classifier"
+author: "Chad Hochberg, MD MHS (Adapted from CLIF Consortium Code written by Chad Hochberg and Anna Barker, MD PhD"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#GOAL of This Script: Evaluate How a Persistent Hypoxemia Definition (excluding those with CRecent Surgery) Performs in to Identifying Patients with Clinician-adjudicated ARDS
+
+#Specify File Paths, Project Path and Site - SITE SPECIFIC
+#Load the Required CLIF Tables (or if using ARROW/parquet refer to table in situ on storage drive)
+```{r}
+#Define project Paths
+tables_location <- '[clif_tables]'
+data_path <- "[project_data]"
+project_location <- "[project_location]"
+ccrd_data <- '[Hopkins ICU Registry]'
+
+#Define Site and CLIF FIle Type
+site <- "Hopkins"
+file_type <- "parquet"
+
+include_pediatric <- FALSE
+include_er_deaths <- TRUE
+```
+
+
+```{r Load Needed Libraries, include=FALSE}
+packages <- c("lubridate", 
+              "tidyverse", 
+              "dplyr",
+              "tableone", 
+              "broom", 
+              "arrow", 
+              "rvest", 
+              "readr", 
+              "fst", 
+              "data.table", 
+              "collapse", 
+              "tictoc")
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+rm(packages, install_if_missing)
+
+#Use Dplyr select as default
+select <- dplyr::select
+
+```
+
+```{r Convert CCRD Dates to UTC}
+fn.utc_timezone <- function(df) {
+  # Get the dataset schema
+  sch <- df$schema
+  #Which Fields are Datetime Types?
+  datetime_fields <- keep(sch$fields, function(field) {
+    grepl("^timestamp", field$type$ToString())
+  })
+  # Extract the names of these datetime columns
+  datetime_cols <- map_chr(datetime_fields, "name")
+  
+  #Now Convert DateTime Columns to UTC
+  # Now convert the datetime columns to UTC by casting them
+  # Here we use arrow::timestamp("us", "UTC") to define the target type.
+  df <- df %>%
+    mutate(across(all_of(datetime_cols), ~ cast(.x, arrow::timestamp("us", "UTC")))) |>
+    compute()
+  
+}
+
+```
+
+##Load ARDS Reviewed and Prone Culture Cohorts
+```{r Load Data}
+#ARDS Reviewed Merge with Cohort ID and Encounter Block
+ards_reviewed <- open_dataset(paste0(data_path, 'ards_reviewed.parquet')) |>
+  rename(hospitalization_id = pat_enc_csn_id) |>
+  relocate(hospitalization_id, .before = year) |>
+  filter(year!=2024) |>
+  collect()
+```
+
+#Objective: Identify Patients in the ARDS Reviewed Cohort for PROSEVA eligibility
+#Modification from CLIF Prone Study - Will accept first PROSEVA blood gas in first 72 Hours
+# Specify inpatient cohort parameters
+Age >= 18 Years
+PF <=150 and FiO2 >= 0.6, met in the first 72 hours of IMV initiation (t_PROSEVA_first)
+AND
+Confirmed on second qualifying blood gas in a 12-hour window beginning 12 hours after the first eligible blood gas (t_proseva_first + 12 hours > t_proseva_second < t_proseva_first + 24 hours)
+OR 
+Patient recieves prone positioning, NMB infusion or pulmonary vasodialtor in the 24 hours after meeting initial hypoxemia criteria
+#Specify required CLIF Tables
+```{r}
+#List of table names from CLIF 2.0
+tables <- c("patient", "hospitalization", "vitals", "labs", 
+            "medication_admin_continuous", "adt", 
+            "patient_assessments", "respiratory_support", "position", 
+            "dialysis", "intake_output", "ecmo_mcs", "procedures", 
+            "admission_diagnosis", "provider", "sensitivity", 
+            "medication_orders", "medication_admin_intermittent", 
+            "therapy_details", "microbiology_culture", "sensitivity", "microbiology_nonculture")
+
+# Tables that should be set to TRUE for this project
+true_tables <- c("patient", "hospitalization", "adt", "patient_assessments",
+                 "vitals", "labs", "medication_admin_continuous", "respiratory_support",
+                 "position", "microbiology_nonculture")
+
+# Create a named vector and set the boolean values
+table_flags <- setNames(tables %in% true_tables, tables)
+```
+
+
+
+```{r}
+# List all CLIF files in the directory
+clif_table_filenames <- list.files(path = tables_location, 
+                                   pattern = paste0("^clif_.*\\.", file_type, "$"), 
+                                   full.names = TRUE)
+
+# Extract the base names of the files (without extension)
+clif_table_basenames <- basename(clif_table_filenames) |>
+  str_remove(paste0("\\.", file_type, "$"))
+
+# Create a lookup table for required files based on table_flags
+required_files <- paste0("clif_", names(table_flags)[table_flags])
+
+# Check if all required files are present
+missing_tables <- setdiff(required_files, clif_table_basenames)
+if (length(missing_tables) > 0) {
+  stop(paste("Error: Missing required tables:", paste(missing_tables, collapse = ", ")))
+}
+
+# Filter only the filenames that are required
+required_filenames <- clif_table_filenames[clif_table_basenames %in% required_files]
+
+# Read the required files into a list of data frames
+if (file_type == "parquet") {
+  data_list <- lapply(required_filenames, open_dataset)
+} else if (file_type == "csv") {
+  data_list <- lapply(required_filenames, read_csv)
+} else if (file_type == "fst") {
+  data_list <- lapply(required_filenames, read.fst)
+} else {
+  stop("Unsupported file format")
+}
+
+# Assign the data frames to variables based on their file names
+for (i in seq_along(required_filenames)) {
+  # Extract the base name of the file (without extension)
+  object_name <- str_remove(basename(required_filenames[i]), paste0("\\.", file_type, "$"))
+  # Make the object name valid for R (replace invalid characters with underscores)
+  object_name <- make.names(object_name)
+  # Assign the tibble to a variable with the name of the file
+  assign(object_name, data_list[[i]])
+}
+```
+
+#Now Ready to Identify Cohort
+#Identify Hospitalizations for Adults >= 18 Who Were Ever in an ED, Ward or ICU
+#At This Stage Identify Encounters that Are 'Linked', that is continuous admission within the health system but in different hospitals (or sometimes ED to inpatient in same hospital)
+#Script below will create an 'encounter_block' variable toto identify admissions at the patient_id level that are linked
+```{r Identify Patients in the ARDS Reviewed Cohort}
+clif_hospitalization <- clif_hospitalization |>
+   compute()
+
+if (!include_pediatric) {
+  clif_hospitalization <- clif_hospitalization |>
+    filter(age_at_admission >= 18) |>
+    compute()
+}
+
+#Create an Hospital Block ID - This is to Identify Continuous Hospitalizations When Patients Are Transferred Between Hospitals in One Health System
+#This code is intended be robust to various ways encounters may be coded in CLIF databases
+hospital_blocks <- clif_hospitalization |>
+  select(patient_id, hospitalization_id, admission_dttm, discharge_dttm) |>
+  arrange(patient_id, admission_dttm) |>
+  collect()
+
+#Identify Admissions That Occur Within 3 Hours of a Discharge (Will Consider Those Linked and as Part of One Continuous Encounter)
+#Use Data Table for Speed
+linked_encounters <- setDT(hospital_blocks)
+#Create a Variable for the time of the next admission and time of previous discharge
+linked_encounters[, ':=' (next_admit_dttm = data.table::shift(admission_dttm, n=1, type = "lead")), by = patient_id]
+linked_encounters[, ':=' (prev_dc_dttm = data.table::shift(discharge_dttm, n=1, type = "lag")), by = patient_id]
+#Calculates Time Between Discharge and Next Admit
+linked_encounters[, next_diff_time := difftime(next_admit_dttm, discharge_dttm, units = "hours")]
+linked_encounters[, prev_diff_time := difftime(admission_dttm, prev_dc_dttm, units = "hours")]
+
+#Now Create Variable Indicating a Linked Encounter (next_admit-dc time <6 hours or prev_dc-admint <6 hours)
+linked_encounters[, linked := fcase(
+  (next_diff_time <6 | prev_diff_time <6), 1)]
+#Filter to Only Linked Encounters and number them
+linked_encounters <- linked_encounters[linked==1]
+#This Identifies the First Encounter in a Series of Linked Encounters
+linked_encounters[, first_link := fcase(
+  (rowid(linked)==1 | (next_diff_time<6 & prev_diff_time>6)), 1
+), by = patient_id]
+#Now Numbers Encounters, easier in dplyr
+#Filter to Just First Links, Number them and then Remerge with linked encounters
+temp <- as_tibble(linked_encounters) |>
+ filter(first_link==1) |>
+ group_by(patient_id) |>
+ mutate(link_group=row_number()) |>
+ ungroup() |>
+ select(hospitalization_id, link_group) 
+linked_encounters <- as_tibble(left_join(linked_encounters, temp, join_by(hospitalization_id))) |>
+  fill(link_group, .direction = c("down")) |>
+  #Create a Variable Indicating Which Number of LIinked Encounter the Encounter is
+  group_by(patient_id, link_group) |>
+  mutate(link_number=row_number()) |>
+  ungroup() |>
+  select(hospitalization_id, linked, link_number)
+rm(temp)
+
+#Now Join Back to Hospitalization Table
+clif_hospitalization <- clif_hospitalization |>
+  left_join(linked_encounters) |>
+  mutate(linked=if_else(is.na(linked), 0, linked)) |>
+  compute()
+
+#Pull Out the Any Linked Encounter that Is NOt the First Encounter and Assign Each Encounter an Encounter Block ID in the Original clif_hospitalization table
+df_link <- clif_hospitalization |>
+  filter(link_number>1) |>
+  collect()
+
+clif_hospitalization <- clif_hospitalization |>
+  group_by(patient_id) |>
+  arrange(patient_id, admission_dttm) |>
+  #Remove Link Numbers that Are Not First in Link Encounter
+  filter(link_number==1 | is.na(link_number)) |>
+  #Make Encounter Blocks
+  collect() |>
+  mutate(encounter_block=row_number()) |>
+  rowbind(df_link, fill = TRUE) |> #Bring Back in Link Numbers >1
+  group_by(patient_id) |> arrange(patient_id, admission_dttm) |>
+  fill(encounter_block, .direction = "down") |>
+  ungroup()|>
+  #Finally, for Linked Encounters Identify 'Final_admit_date' and 'final_dc_date' which are the first and last dates of a link block
+  group_by(patient_id, encounter_block) |>
+  mutate(final_admission_dttm=fcase(
+    row_number()==1, as.POSIXct(admission_dttm)
+  )) |>
+  mutate(final_discharge_dttm=fcase(
+    row_number()==n(), as.POSIXct(discharge_dttm)
+  )) |>
+  mutate(final_discharge_category=fcase(
+    row_number()==n(), discharge_category
+  )) |>
+  mutate(final_discharge_name=fcase(
+    row_number()==n(), discharge_name
+  )) |>
+  fill(final_admission_dttm, 
+       final_discharge_dttm,
+       final_discharge_name, 
+       final_discharge_category, 
+       .direction = 'updown') |>
+  relocate(encounter_block, .after = 'hospitalization_id') |>
+  as_arrow_table()
+
+rm(linked_encounters, df_link, hospital_blocks)
+
+#Keep Track for Consort Diagram
+patients <- length(unique(clif_hospitalization$patient_id))
+encounters <- length(clif_hospitalization$hospitalization_id)
+cat('\n In', site, 'CLIF data there are', patients,'unique patients with', encounters, 'encounters \n')
+
+#Now Take the Encounter Blocks and Merge with ARDS Reviewed File
+hosp_ids <- ards_reviewed |> select(hospitalization_id) |> mutate(in_cohort=1)
+enc_blocks <- clif_hospitalization |>
+  left_join(hosp_ids) |>
+  filter(in_cohort==1) |>
+  select(patient_id, hospitalization_id, encounter_block) |>
+  collect()
+ards_reviewed <- ards_reviewed |> left_join(enc_blocks)
+
+#Now FIlter CLIF hospitalizations to these encounter blocks
+enc_blocks <- ards_reviewed |> select(patient_id, encounter_block) |>
+  mutate(in_cohort=1)
+clif_hospitalization <- clif_hospitalization |>
+  left_join(enc_blocks) |>
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  compute()
+
+#Keep Track for Consort Diagram
+patients <- length(unique(clif_hospitalization$patient_id))
+encounters <- length(clif_hospitalization$hospitalization_id)
+cat('\n In', site, 'CLIF data and with ARDS reviewed there are', patients,'unique patients with', encounters, 'encounters \n')
+```
+
+#Filter Only to Patients Who Receive Mechanical Ventilation in the ARDS Reviewed Cohort
+```{r}
+#Bring in Temporary File with patient_id, hospitalization_id and encounter_block
+temp_ids <- clif_hospitalization |>
+  select(patient_id, hospitalization_id, encounter_block) |>
+  collect()
+
+#Identify Patients Who EVER Received Mechanical Ventilation During a Hospitalization
+vent <- clif_respiratory_support |>
+  #Only Need IDs in the Current Working ClIF hospitalization Table
+  filter(hospitalization_id %in% temp_ids$hospitalization_id) |>
+  #Will Also Merge in Encounter Block Here - Will Allow Us to Keep Track of LInked Encounters
+  left_join(temp_ids) |>
+  compute()
+rm(temp_ids)
+
+#Identify Those Who Have Ever Been on a Vent During an Encounter Block
+vent <- vent |> 
+  mutate(on_vent=if_else(device_category=='IMV', 1, 0)) |>
+  group_by(patient_id, encounter_block) |>
+  mutate(ever_vent=if_else(max(on_vent, na.rm=T)==1, 1, 0)) |>
+  filter(ever_vent==1) |>
+  select(-ever_vent) |>
+  ungroup() |>
+  compute()
+
+#Identify First Vent Start Time and Vent Duration
+#Keep Track for Consort Diagram
+patients <- length(unique(vent$patient_id))
+encounters <- length(unique(vent$hospitalization_id))
+cat('\n Paitents Receiving Mechanical Ventilation: \n  In', site, 'CLIF data there are', patients,'unique patients with', encounters, 'encounters \n')
+```
+#Identify Ventilator Episodes
+```{r}
+#Now Identify Ventilator Episodes and the Duration of Each Episodes
+#This Uses Logic Created by Nick Ingraham to Carry Forward Device Category and Device Names
+vent <- vent |>
+  arrange(patient_id, recorded_dttm) |>
+  mutate(
+    device_category = 
+    if_else(
+        is.na(device_category) & is.na(device_name) &
+          str_detect(mode_category, 
+                     "Pressure Control|Assist Control-Volume Control|Pressure Support/CPAP|Pressure-Regulated Volume Control|SIMV"),
+        "IMV",
+        device_category
+      ),
+    device_name = 
+      if_else(
+        str_detect(device_category, "IMV") & is.na(device_name) &
+          str_detect(mode_category, "Pressure Control|Assist Control-Volume Control|Pressure Support/CPAP|Pressure-Regulated Volume Control|SIMV"),
+        "IMV",
+        device_name
+      ),
+  ) |>
+  collect() |>
+  #     If device before is VENT + normal vent things ... its VENT too 
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, recorded_dttm) |>
+  mutate(device_category = fifelse(is.na(device_category) & 
+                                     lag(device_category == "IMV") & 
+                                     tidal_volume_set > 1 & 
+                                     resp_rate_set > 1 & 
+                                     peep_set > 1, 
+                                   "IMV", 
+                                   device_category)) |>
+  # If device after is VENT + normal vent things ... its VENT too 
+  mutate(device_category = fifelse(is.na(device_category) & 
+                                     lead(device_category == "IMV") & 
+                                     tidal_volume_set > 1 & 
+                                     resp_rate_set > 1 & 
+                                     peep_set > 1, 
+                                   "IMV", 
+                                   device_category)) |>
+  # doing this for BiPAP as well
+  mutate(device_category = fifelse(is.na(device_category) & 
+                                     lag(device_category == "NIPPV") & 
+                                     #minute_vent > 1 & ###NEED TO BUILD INTO JHU DATA
+                                     pressure_support_set > 1, 
+                                   "NIPPV", 
+                                   device_category)) |>
+  
+  mutate(device_category = fifelse(is.na(device_category) & 
+                                     lead(device_category == "NIPPV") & 
+                                     #minute_vent > 1 & ###NEED TO BUILD INTO JHU DATA
+                                     pressure_support_set > 1, 
+                                   "NIPPV", 
+                                   device_category)) |>
+  ungroup()
+  
+# Now use a Fill Forward Method with Device Category
+vent <- vent |>
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, recorded_dttm) |>
+  fill(device_category, .direction = 'downup') |>
+  ungroup() |>
+  as_arrow_table()
+
+#Goal of Function Below is to Define Ventilator Episodes & Ventilator Liberations (> 24 Hours off of MV)
+#First will Filter Down to Reduced Table of 'device_category' transitions; For example: This includes rows when a device_category switches from one to another; Also keep First and Last Rows
+device_transitions <- vent |> 
+  arrange(patient_id, recorded_dttm) |> #Puts in Correct Order
+  collect() |>
+  group_by(patient_id, encounter_block) |>
+  mutate(prev_value_diff = fifelse(
+    (device_category!=data.table::shift(device_category, n=1, type = "lag")), 1, 0)) |>
+  mutate(prev_value_diff=fifelse(is.na(prev_value_diff), 0, prev_value_diff)) |> #For First Row
+  filter(prev_value_diff == 1 |
+           row_number()==1 | row_number() == n()) |>
+  ungroup()
+
+#Define Ventilator Episodes - Define Ventilator Liberation as 24 Hours Breathing Off Ventilator, Otherwise Will Include That Time in Ventilator Duration
+#For Patients Who Start IMV on Last Row can Calculate Time on Vent Using Final Discharge Time
+dc_time <- clif_hospitalization |>
+  select(patient_id, encounter_block, final_discharge_dttm) |>
+  distinct()  |> #1 Row for 1 Encounter Block 
+  collect()
+
+#Temporarily Number Vent Episodes
+device_transitions <- device_transitions |>
+  join(dc_time, how = 'left') |>
+  group_by(patient_id, encounter_block, device_category) |>
+  mutate(category_number=row_number()) |>
+  #If a Last Row of an Enconter Block is Not a Device Transition Set Category Number to NA
+  group_by(patient_id, encounter_block) |>
+  mutate(category_number=fifelse(
+    row_number()==n() & prev_value_diff!=1, NaN, category_number
+  )) |>
+  ungroup() |>
+  group_by(patient_id, encounter_block) |>
+#Define Vent Start and Stop (Temporary)
+  mutate(vent_start=fcase(
+    device_category=='IMV' & (prev_value_diff==1 | row_number()==1), recorded_dttm
+  )) |>
+  mutate(vent_stop=fcase(
+    device_category=='IMV' & lead(prev_value_diff)==1, lead(recorded_dttm),
+    device_category=='IMV' & lead(row_number())==n(), lead(recorded_dttm), #This is Why we Kept Last Row
+    #If the Last Row is 'IMV' Than Use Discharge Time 
+    row_number()==n() & device_category=='IMV', final_discharge_dttm
+  )) |>
+  fill(vent_stop, .direction = 'down') |>
+  #Define Vent Liberation of Prior Vent Episodes as 24 Hours without device_category=='IMV', can fill backwards for this
+  mutate(prior_liberation_new_vent=fcase(
+    #This says if the next time someone is on a vent > 24 hours after the last time on a vent it will be a new episode
+    device_category=='IMV' & category_number==1, 1, #Need to Define This First
+    device_category=='IMV' & recorded_dttm>as.POSIXct(lag(vent_stop))+dhours(24), 1,
+    device_category=='IMV' & recorded_dttm<=as.POSIXct(lag(vent_stop))+dhours(24), 0
+  )) |>
+  #Label if Last Row so Vent Duration Can be Defined by Discharge Time
+  mutate(last_row=fifelse(row_number()==n(), 1, 0)) |>
+  ungroup()
+
+device_transitions <- device_transitions |>
+  #Alternative Way of Labelling Liberation
+  group_by(patient_id, encounter_block) |>
+  mutate(vent_stop=fifelse(
+    device_category=='IMV' & is.na(vent_stop) & last_row==1, final_discharge_dttm, as.POSIXct(vent_stop))) |>
+  mutate(liberation=fcase(
+    device_category!='IMV' & recorded_dttm>as.POSIXct(vent_stop)+dhours(24), 1,
+    device_category=='IMV' & last_row==1, 0
+  )) |>
+  fill(liberation, .direction = 'up') |>
+  ungroup()
+rm(dc_time)
+
+#Renumber 'New' Episodes of MV, that is if the first episode, and then episodes in which the patient was previously liberated, keep the intervening episodes so we can count final duration
+vent_episodes <- device_transitions |>
+  filter(device_category=='IMV') |>
+  group_by(patient_id, encounter_block, prior_liberation_new_vent) |>
+  mutate(vent_episode_number=fifelse(
+    prior_liberation_new_vent==1, row_number(), NaN)) |>
+  group_by(patient_id, encounter_block) |>
+  fill(vent_episode_number, .direction = 'down') |>
+  group_by(patient_id, encounter_block, vent_episode_number) |>
+  mutate(vent_episode_start=fcase(
+    row_number()==1, as.POSIXct(vent_start)
+  )) |>
+  mutate(vent_episode_end=fcase(
+    row_number()==n(), as.POSIXct(vent_stop)
+  )) |>
+  mutate(liberation=fcase(
+    row_number()==n(), liberation,
+    default = NaN
+  )) |>
+  fill(vent_episode_start, vent_episode_end, liberation, mode_category, .direction = 'downup') |>
+  #Now Keep First Row for Each Vent Episode
+  filter(row_number()==1) |>
+  #Calculate Vent Duration
+  mutate(vent_duration_hours=as.duration(vent_episode_end-vent_episode_start)/dhours(1)) |>
+  #DIFFERS from CLIF Prone and Prone Culture
+  #Will Keep The First Event Episode that is > 24 Hours If available
+  mutate(short_vent=fifelse(vent_duration_hours<24, 1, 0)) |> 
+  #group_by(patient_id, encounter_block, short_vent) |> 
+  arrange(patient_id, encounter_block, short_vent, vent_episode_start) |>
+  #Arranged Such that If Avaible Will Select the first Vent Episode that is Greater Than 24 Hours
+  #And if Non Greater Than 24 Will Select First
+  ungroup() |>
+  select(patient_id, hospitalization_id, encounter_block, device_category, mode_category, 
+         liberation, vent_duration_hours, vent_episode_number, vent_episode_end, vent_episode_start)
+
+#Describe Numbers
+cat('\nAt this stage in', site, 'data there are', dim(vent_episodes)[1], 'ventilator episodes among', 
+    length(unique(vent_episodes$hospitalization_id)), 'hospitalizations from', 
+    length(unique(vent_episodes$patient_id)), 'patients.')
+
+#Now Keep Track of Vent Episodes <24 Hours Long
+vent_eligible <- vent_episodes |>
+  group_by(patient_id, encounter_block) |>
+  #Keep All Vent Durations For Now, but Label
+  mutate(short_vent_duration=fifelse(vent_duration_hours<24, 1, 0)) |>
+  arrange(patient_id, encounter_block, short_vent_duration, vent_episode_start) |>
+  filter(row_number()==1)|>
+  ungroup()
+
+#Describe Numbers
+cat(site, '\n After filtering to patients with >24 hours of MV for First Episode there are,', dim(vent_eligible)[1], 'ventilator episodes among,',length(unique(vent_eligible$hospitalization_id)), 'hospitalizations from',length(unique(vent_eligible$patient_id)), 'patients.')
+
+rm(device_transitions)
+```
+
+#EXLUSIONS: FOr this project will keep track of these but not exlude in this file as want to review which of the ARDS reviewed cohort has these features
+-Tracheostomy prior to completing first 24 hours of first vent (includes tracheostomy on admission). 
+-Patient admitted from OSH on the vent
+```{r Implement Exclusion Criteria}
+#List of patient_id, encounter_block, hospitalization_id and vent_start
+temp_ids <- vent_eligible |>
+  select(patient_id, encounter_block) |>
+  mutate(in_cohort=1)
+#Create a Table Containing the 3 Identifiers c('patient_id', 'hospitalization_id', 'encounter_block')
+cohort_ids <- clif_hospitalization |>
+  left_join(temp_ids) |>
+  filter(in_cohort==1) |>
+  select(patient_id, hospitalization_id, encounter_block, in_cohort) |>
+  collect()
+rm(temp_ids)
+
+#Tracheostomy in First 24 Hours of First Vent 
+trach <- clif_respiratory_support |>
+  left_join(cohort_ids) |>
+  filter(in_cohort==1) |> #This allows us to keep all encounter block info
+  select(patient_id, recorded_dttm, encounter_block, tracheostomy) |>
+  filter(tracheostomy==1) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  collect() |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  mutate(first_trach_time=fcase(
+    row_number()==1, as.POSIXct(recorded_dttm)
+  )) |>
+  ungroup() |>
+  select(patient_id, encounter_block, tracheostomy, first_trach_time)
+
+#Merge with Vent Eligible and Exclude if first_trach_time within 24 hours of vent start
+vent_eligible <- vent_eligible |>
+  join(trach, how = 'left') |>
+  mutate(tracheostomy=fifelse(is.na(tracheostomy), 0, tracheostomy)) |> #If not merged indicates no trach performed
+  mutate(trach_within_24=fcase(
+    as.POSIXct(vent_episode_start)+dhours(24)>first_trach_time, 1,
+    default = 0
+  ))
+
+#Describe for Consort
+cat('\n At', site,',', length(unique(vent_eligible$hospitalization_id[vent_eligible$tracheostomy==1])), 'patient hospitalizations were ventilated via a tracheostomy,', length(unique(vent_eligible$hospitalization_id[vent_eligible$trach_within_24==1])), 'within 24 hours of ventilator start. \n')
+
+#How Many Patients Arrive First to ICU and First Device is a Vent?
+#First Define What the First Location Is
+osh_transfer <- clif_adt |>
+  left_join(cohort_ids) |> #Here need to join first and then filter to those in cohort
+  filter(in_cohort==1) |>
+  arrange(patient_id, encounter_block, in_dttm) |>
+  collect() |>
+  group_by(patient_id, encounter_block) |> # Replace group_column with the column(s) you want to group by
+  filter(row_number()==1) |>
+  ungroup() |>
+  mutate(first_location=location_category)
+
+#Now Define First Device Category
+first_device <- clif_respiratory_support |>
+  left_join(cohort_ids) |> #Here need to join first and then filter to those in cohort
+  filter(in_cohort==1) |>
+  filter(!is.na(device_category)) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  collect() |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  mutate(first_device=device_category) |>
+  select(patient_id, encounter_block, first_device)
+
+#Merge back with OSH
+osh_transfer <- osh_transfer |>
+  join(first_device, how ='left') |>
+  mutate(transfer_on_vent=fifelse(
+    tolower(first_location)=='icu' & first_device=='IMV', 1, 0
+  )) |>
+  select(patient_id, encounter_block, transfer_on_vent)
+
+#Merge Into Vent Eligible
+vent_eligible <- vent_eligible |>
+  left_join(osh_transfer, join_by(patient_id, encounter_block)) 
+rm(osh_transfer, first_device)
+
+#Describe for Consort
+cat('\n At', site,',', length(unique(vent_eligible$hospitalization_id[vent_eligible$transfer_on_vent==1])), 'patient hospitalizations were from patients who met criteria for having been transfered while on a ventilator.') 
+```
+```{r Clean CLIF Labs Data for PaO2 and Merge with Respiratory Support for P/F Ratios}
+#Will Use cohort_ids table and vent start to filter to relevant hospitalizations and times
+vent_times <- vent_eligible |>
+  select(patient_id, encounter_block, vent_episode_end, vent_episode_start,first_trach_time, vent_duration_hours, liberation)
+
+#Filter Labs Table to Just Hospitaliztion IDs in the Cohort
+clif_labs <- clif_labs |>
+  left_join(cohort_ids) |> #NOTE: clif_labs will now include patient_id and encounter_block
+  filter(in_cohort==1) |>
+  select(-in_cohort) |>
+  compute()
+
+#PaO2 Table
+pao2 <- clif_labs |>
+  filter(lab_category=='po2_arterial' & !is.na(lab_value)) |>
+  filter(lab_value!='NULL') |>
+  filter(lab_value_numeric>40 & lab_value_numeric<=700) |> #Lower Bound Filtering for PaO2 Outliers > 40 and upper bound assumes FiO2 of 1.0 A-a gradient of 0 and Paco2 of 10
+  distinct() |>
+  select(patient_id, encounter_block, lab_collect_dttm, lab_value_numeric) |>
+  collect() |>
+  mutate(recorded_dttm=as.POSIXct(lab_collect_dttm)) |> #For Merging with Vent Data
+  rename(pao2 = lab_value_numeric) 
+
+# Check fio2_set 
+fio2_mean <- clif_respiratory_support |> select(fio2_set) |> summarise(fio2_mean = mean(fio2_set, na.rm = TRUE)) |> collect() # fixing if its less than one # You will get a warning but it will be fixed on its own with IF statement 
+if(fio2_mean > 1){ 
+  clif_respiratory_support <- clif_respiratory_support |> mutate(fio2_set = fio2_set / 100) |> compute() }
+
+#Create Vent Data Table for the First Ventilator Episode (the ONe being analyzed for this study)
+#Merge in PaO2 Data Here
+vent_data <- clif_respiratory_support |>
+  left_join(cohort_ids) |>
+  filter(in_cohort==1) |>
+  left_join(vent_times) |>
+  collect() |>
+  filter(recorded_dttm>=as.POSIXct(vent_episode_start) &   
+           recorded_dttm<=as.POSIXct(vent_episode_end)) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>  
+  group_by(patient_id, encounter_block) |>
+  fill(device_category, device_name, .direction = 'down') |>
+  ungroup() |>
+  #Bring in PaO2 Here and Then Fill Again
+  join(pao2, how ='full') |>
+  group_by(patient_id, encounter_block) |>
+  fill(vent_episode_end, vent_episode_start, .direction = 'downup') |>
+  filter(recorded_dttm>=as.POSIXct(vent_episode_start) & 
+           recorded_dttm<=as.POSIXct(vent_episode_end)) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>  
+  fill(device_category, device_name, .direction = 'down') |>
+  #Now Group by Patient/Encounter/device_category and fill peep and fio2
+  group_by(patient_id, encounter_block, device_category) |>
+  mutate(ever_tracheostomy=tracheostomy) |>
+  fill(peep_set, 
+       fio2_set, 
+       vent_episode_start,
+       vent_episode_end,
+       mode_category,
+       first_trach_time,
+       liberation,
+       vent_duration_hours,
+       hospitalization_id,
+       ever_tracheostomy,
+       .direction = 'downup') |>
+  fill(tracheostomy, .direction= 'down') |>
+    ungroup() 
+
+#Quality Check FiO2 and PEEP Data
+#Calculate PF
+#Indicate if 'proseva_eligible'
+vent_data <- vent_data |>
+  mutate(fio2_set=fifelse(
+  fio2_set<0.21 | fio2_set>1, NaN, fio2_set)) |>
+  mutate(peep_set=fifelse(
+    peep_set<0 | peep_set>35, NaN, peep_set)) |>
+  #Now Calculate PF Ratios
+  mutate(pf_ratio=pao2/fio2_set) |>
+  #Indicate if PROSEVA Eligible - This Should ALL be During Vent Episode
+  mutate(proseva_eligible=fcase(
+    is.na(pao2) | is.na(fio2_set), NaN,
+    pf_ratio<=150 & fio2_set>=0.6, 1,
+    !is.na(pf_ratio) & (pf_ratio>150 | fio2_set<0.6), 0
+  )) 
+
+#Keep Track of How Many ABGs During Eligible Vent Episode and How Many PROSEVA Eligible
+pf_table <- vent_data |>
+  filter(!is.na(pf_ratio)) |>
+  mutate(n_pfs = n()) |>
+  group_by(proseva_eligible) |>
+  mutate(n_proseva_eligible=n()) |>
+  ungroup() |>
+  mutate(n_proseva_eligible=fifelse(
+    proseva_eligible==1, n_proseva_eligible, NaN)) |>
+  fill(n_proseva_eligible, .direction = 'updown') |>
+  summarise(
+    '# PF Ratios' = mean(n_pfs),
+    '# PROSEVA Eligible' = mean(n_proseva_eligible),
+    '% PROSEVA Eligible' = round(mean(n_proseva_eligible/n_pfs)*100, digits= 2)
+  )
+pf_table
+rm(pf_table, pao2)
+```
+```{r Implement PROSEVA Inclusion Criteria}
+proseva_criteria <- vent_data |>
+  filter(!is.na(pf_ratio)) |>
+  #Filter to First 96 Hours After Vent Start
+  filter(recorded_dttm<=as.POSIXct(vent_episode_start)+dhours(96)) |>
+  #First Have to Meet First Criteria Within 72 Hours
+  mutate(temp_proseva_time=fifelse(
+    proseva_eligible==1 & recorded_dttm<=as.POSIXct(vent_episode_start)+dhours(72), 1, 0
+  )) |>
+  group_by(patient_id, encounter_block, temp_proseva_time, proseva_eligible) |> #By grouping together can define the 1st PF ratios that Meet PROSEVA criteria
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  mutate(temp_pf=row_number()) |>
+  ungroup() |>
+  #Identify the PF ratio, FIo2, PEEP, and Mode Where Proseva Criteria First met
+  mutate(first_proseva_pf=fcase(
+    temp_pf==1 & proseva_eligible==1 & temp_proseva_time==1, pf_ratio
+  )) |>
+  mutate(first_proseva_fio2=fcase(
+    temp_pf==1 & proseva_eligible==1 & temp_proseva_time==1, fio2_set
+  )) |>
+  mutate(first_proseva_peep=fcase(
+    temp_pf==1 & proseva_eligible==1 & temp_proseva_time==1, peep_set
+  )) |>
+  mutate(first_proseva_mode=fcase(
+    temp_pf==1 & proseva_eligible==1 & temp_proseva_time==1, mode_category
+  )) |>
+  mutate(t_proseva_first=fcase(
+    temp_pf==1 & proseva_eligible==1 & temp_proseva_time==1, recorded_dttm
+  )) |>
+  group_by(patient_id, encounter_block) |>
+  fill(first_proseva_pf,
+       first_proseva_fio2,
+       first_proseva_peep,
+       first_proseva_mode,
+       t_proseva_first,
+       .direction = 'updown') |>
+  ungroup() |>
+  #Now Repeat For The 2nd Eligible Time - Must be within 12-24 Hours t_proseva_first
+  #This Table is Already Windowed to First 96 Hours of Vent and Ends When patient is extubated/dies/transfers (if before 72 hours)
+  mutate(eligible_proseva_t2=fifelse(
+    recorded_dttm>=as.POSIXct(t_proseva_first)+dhours(12) & 
+    recorded_dttm<=as.POSIXct(t_proseva_first)+dhours(24), 1, 0 # since this is set as 0 when not true, fill updown doesn't overwrite it. 
+  )) |>
+  group_by(patient_id, encounter_block, eligible_proseva_t2, proseva_eligible) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  mutate(temp_pf=row_number()) |>
+  ungroup() |>
+  mutate(second_proseva_pf=fcase(
+    temp_pf==1 & proseva_eligible==1 & eligible_proseva_t2, pf_ratio
+  )) |>
+  mutate(second_proseva_fio2=fcase(
+    temp_pf==1 & proseva_eligible==1 & eligible_proseva_t2, fio2_set
+  )) |>
+  mutate(second_proseva_peep=fcase(
+    temp_pf==1 & proseva_eligible==1 & eligible_proseva_t2, peep_set
+  )) |>
+  mutate(second_proseva_mode=fcase(
+    temp_pf==1 & proseva_eligible==1 & eligible_proseva_t2, mode_category
+  )) |>
+  mutate(t_proseva_second=fcase(
+    temp_pf==1 & proseva_eligible==1 & eligible_proseva_t2, recorded_dttm
+  )) |>
+  group_by(patient_id, encounter_block) |>
+  fill(second_proseva_pf,
+       second_proseva_fio2,
+       second_proseva_peep,
+       second_proseva_mode,
+       t_proseva_second,
+       .direction = 'updown') |>
+  ungroup() |>
+  #NOW Define Who is Eligible by PROSEVA criteria
+  mutate(eligible_by_proseva=fifelse(
+    !is.na(first_proseva_pf) & !is.na(second_proseva_pf), 1, 0
+  )) |>
+  #Select Wanted Variables and Keep First Row for Each Patient and Encounter Block
+  select(patient_id, encounter_block, first_proseva_pf:eligible_by_proseva, ever_tracheostomy) |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |> #by selecting first row number, proseva_second_eligible ==0  if not missing, fine bc won't use it anymore
+  ungroup()
+
+check <- proseva_criteria |> filter(!is.na(first_proseva_pf))
+cat('There are', length(unique(ards_reviewed$patient_id)) - length(unique(check$patient_id)), 'patient who was in the initial ARDS review cohort who do not have a proseva-eligible status defined here.\nThe ventstart date is correct in this updated dataset and was mispecified in initial data pull because of an encounter block issue')
+
+```
+```{r Define Potentially Eligible Proning Episodes - Those Occurring During First Ventilator Episode}
+#Filter Position Table to Relevant Cohort and Only Times During the First Ventilator Episode
+temp_times <- vent_times |> 
+  select(patient_id, encounter_block, vent_episode_start, vent_episode_end)
+
+prone_episodes_all <- clif_position |>
+  left_join(cohort_ids) |> #NOTE: clif_position will now include patient_id and encounter_block
+  filter(in_cohort==1) |>
+  filter(!is.na(position_category)) |>
+  select(-in_cohort) |>
+  left_join(temp_times) |>
+  collect()
+  
+prone_episodes <- prone_episodes_all |>
+  mutate(recorded_dttm=as.POSIXct(recorded_dttm)) |>
+  filter(recorded_dttm>=as.POSIXct(vent_episode_start) & 
+           recorded_dttm<=as.POSIXct(vent_episode_end)) |>
+  #Filter to Rows Where 'position_category' changes --> This will allow some institutions to select 'all positions' and some to only keep rows where position changes (as I did in my CLIF ETL)
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  mutate(keep=fcase(
+    row_number()==1, 1,
+    row_number()==n(), 1,
+    position_category!=lag(position_category), 1)) |>
+  mutate(keep=fifelse(
+    #IF Both Prone and Supine Are Recorded at the Same Time Will Exclude
+    position_category!=lag(position_category) & recorded_dttm==lag(recorded_dttm), 0, keep)) |>
+  ungroup() |>
+  filter(keep==1) |>
+  #Deal with Last Row if It is NOT a new Category
+  group_by(patient_id, encounter_block) |>
+  mutate(keep=fifelse(
+    row_number()==n() & 
+      position_category==lag(position_category) &
+      n()>1, 0, keep
+  )) |>
+  #Calculate the Time in Hours to Next Observation - For the Second to Last Row
+  mutate(time_to_lastrow=fcase(
+    lead(keep)==0,
+    as.duration(lead(recorded_dttm)-recorded_dttm)/dhours(1))) |>
+  #This Keeps Track of Whether the Last Observation in a Position_category SHould Use the Vent-end or time to last row to determine duration
+  mutate(use_time_to_lastrow=fcase(
+    lead(row_number())==n() & lead(keep)==0, 1,
+    row_number()==n() & keep==1, 0,
+    default = 0
+  )) |>
+  filter(keep==1) |>
+  #Now Define # of Prone Episodes (during First Ventilator Episode)
+  group_by(patient_id, encounter_block, position_category) |>
+  mutate(temp_episode_num=row_number()) |>
+  ungroup() |>
+  group_by(patient_id, encounter_block) |>
+  mutate(prone_episode_num=fcase(
+    position_category=='prone', temp_episode_num)) |>
+  ungroup() |>
+  #Define Prone Position Duration - Time to Next Row OR if the Prone Episode is Last Row it is Time to Vent End
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  mutate(prone_episode_hours=fcase(
+    position_category=='prone' & row_number()!=n(), as.duration(lead(recorded_dttm)-recorded_dttm)/dhours(1),
+    position_category=='prone' & row_number()==n() & use_time_to_lastrow==0, as.duration(vent_episode_end-recorded_dttm)/dhours(1),
+    position_category=='prone' & row_number()==n() & use_time_to_lastrow==1, time_to_lastrow,
+    position_category=='prone' & row_number()==1 & use_time_to_lastrow==0, as.duration(vent_episode_end-recorded_dttm)/dhours(1),
+    position_category=='prone' & row_number()==1 & use_time_to_lastrow==1, time_to_lastrow
+  )) |>
+  filter(position_category=='prone') |>
+  mutate(prone_episodes=max(prone_episode_num)) |>
+  mutate(first_prone_episode_hours=fcase(
+    prone_episode_num==1, prone_episode_hours
+  )) |>
+  mutate(first_prone_time=fcase(
+    prone_episode_num==1, as.POSIXct(recorded_dttm)
+  )) |>
+  mutate(median_pt_prone_duration=median(prone_episode_hours)) |>
+  mutate(mean_pt_prone_duration=mean(prone_episode_hours)) |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(patient_id, encounter_block, prone_episodes:mean_pt_prone_duration)
+rm(temp_times)
+```
+
+```{r Now Incorporate with Proseva Criteria Into Final Proseva-Proning Criteria for This Cohort}
+#For Those Who Meet PROSEVA Criteria as OUtlined Above They are PROSEVA Eligible
+#We Will Also Include Patients Who Are Proned Within 24 Hours of First Qualifying Blood Gas
+proseva_prone_table <- proseva_criteria |>
+  full_join(prone_episodes) |>
+  #Define Those Who Meet Cohort Criteria By Being Proned Within 24 Hours of First Eligibility Regardless of 2nd PROSEVA Criteria
+  mutate(eligible_by_prone=fcase(
+    first_prone_time<=t_proseva_first+dhours(24) & first_prone_time>=t_proseva_first, 1,
+    default = 0
+  )) |>
+  mutate(cohort_eligible=fifelse(
+    eligible_by_proseva==1 | eligible_by_prone==1, 1, 0
+  )) |>
+  relocate(cohort_eligible, eligible_by_proseva, eligible_by_prone, .after = encounter_block) |>
+  #Define Time of Enrollment (min(t_proseva_second, t_proning))
+  mutate(t_enrollment=fcase(
+    cohort_eligible==1 & is.na(first_prone_time), t_proseva_second,
+    cohort_eligible==1 & t_proseva_second<first_prone_time, t_proseva_second,
+    cohort_eligible==1 & t_proseva_second>=first_prone_time, first_prone_time,
+    cohort_eligible==1 & eligible_by_prone==1 & eligible_by_proseva==0, first_prone_time #Define if Ever Proned
+  )) |>
+  mutate(proned=fifelse(
+    !is.na(first_prone_time), 1, 0
+  )) |>
+  #Keep Track of Patients Who Are Proned Before Proseva Criteria Met (t_enrollment<t_proseva_first)
+  mutate(cohort_eligible=fifelse(
+    t_enrollment<t_proseva_first, 0, cohort_eligible
+  )) |>
+  #Primary Outcome, Proned within of enrollment
+  mutate(prone_24hour_outcome=fcase(
+    (as.duration(first_prone_time-t_enrollment)<=dhours(24)), 1,
+    (as.duration(first_prone_time-t_enrollment)>dhours(24)), 0,
+    !is.na(t_enrollment) & proned==0, 0
+  )) |>
+  #Secondary Outcome Proned within 12 Hours Of Enrollment or Within 72
+  mutate(prone_12hour_outcome=fcase(
+    (as.duration(first_prone_time-t_enrollment)<=dhours(12)), 1,
+    (as.duration(first_prone_time-t_enrollment)>dhours(12)), 0,
+    !is.na(t_enrollment) & proned==0, 0
+  )) |>
+  mutate(prone_72hour_outcome=fcase(
+    (as.duration(first_prone_time-t_enrollment)<=dhours(72)), 1,
+    (as.duration(first_prone_time-t_enrollment)>dhours(72)), 0,
+    !is.na(t_enrollment) & proned==0, 0
+  ))   
+
+```
+
+```{r Define Persistent Hypoxemia with SF Ratio}
+temp_times <- proseva_prone_table |> 
+  select(patient_id, encounter_block, eligible_by_proseva, t_proseva_first) |>
+  filter(!is.na(t_proseva_first)) |> #Only Need to Evaluate Patients Who Met First PROSEVA Criteria
+  left_join(cohort_ids)
+
+resp_spo2 <- clif_respiratory_support |>
+  filter(hospitalization_id %in% temp_times$hospitalization_id) |>
+  left_join(temp_times) |>
+  compute()
+spo2 <- clif_vitals |>
+  filter(hospitalization_id %in% temp_times$hospitalization_id,
+         vital_category=='spo2',
+         vital_value<=97,
+         vital_value>=80) |> #Can Only Assess S/F if SpO2 <=97%, filter out if below 80 as likely unreliable
+  collect()
+
+resp_spo2 <- resp_spo2 |>
+  left_join(spo2) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  collect() |>
+  #Filter to Time Frame for t_proseva_second
+  filter(recorded_dttm>=t_proseva_first+dhours(12) &
+           recorded_dttm<=t_proseva_first+dhours(24)) |>
+  group_by(patient_id, encounter_block) |>
+  fill(device_category,.direction ='updown') |>
+  group_by(patient_id, encounter_block, device_category) |>
+  fill(fio2_set, .direction = 'updown') |>
+  filter(!is.na(vital_value)) |>
+  filter(fio2_set>=0.6) |> #This Means that the Highest Possible PF is 97/0.6 = 162 (in-line with Brown et al estimates for PF<=150)
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  mutate(t_proseva_second_spo2=recorded_dttm,
+         sf_ratio_second=vital_value/fio2_set) |>
+  select(patient_id, encounter_block, t_proseva_second_spo2, sf_ratio_second)
+
+#Merge Back with PROSEVA Prone Table
+proseva_prone_table <- proseva_prone_table |>
+  left_join(resp_spo2) |>
+  #Cohort Eligible by SPO2
+  mutate(eligible_by_proseva_spo2=fifelse(
+    !is.na(first_proseva_pf) & !is.na(t_proseva_second_spo2), 1, 0
+  )) |>
+  #Define Those Who Meet Cohort Criteria By Being Proned Within 24 Hours of First Eligibility Regardless of 2nd PROSEVA Criteria
+  mutate(cohort_eligible_spo2=fifelse(
+    eligible_by_proseva_spo2==1 | eligible_by_prone==1, 1, 0)) |>
+  relocate(cohort_eligible_spo2, eligible_by_proseva_spo2, .after = eligible_by_prone) |>
+  #Define Time of Enrollment (min(t_proseva_second, t_proning))
+  mutate(t_enrollment_spo2=fcase(
+    cohort_eligible_spo2==1 & is.na(first_prone_time), t_proseva_second_spo2,
+    cohort_eligible_spo2==1 & t_proseva_second_spo2<first_prone_time, t_proseva_second_spo2,
+    cohort_eligible_spo2==1 & t_proseva_second_spo2>=first_prone_time, first_prone_time,
+    cohort_eligible_spo2==1 & eligible_by_prone==1 & eligible_by_proseva_spo2==0, first_prone_time #Define if Ever Proned
+  )) 
+```
+
+```{r Evaluate Whether NMB Given Between t_proseva_first and 36 hours after t_proseva first}
+nmb <- clif_medication_admin_continuous |> 
+  filter(hospitalization_id %in% temp_times$hospitalization_id, 
+         med_group=='paralytics') |>
+  left_join(temp_times) |>
+  filter(med_dose>0) |>
+  collect() |>
+  #Filter to 36 Hour Window After t_proseva_first
+  filter(admin_dttm>=t_proseva_first &
+           admin_dttm<t_proseva_first+dhours(36)) |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  mutate(nmb_during_eligibility=1,
+         nmb_name=med_category) |>
+  select(patient_id, encounter_block, nmb_during_eligibility, nmb_name)
+
+#Need to Get PUlmonary Vasodilators from CCRD 'resp_flowsheet'
+###NOTE Pulmonary Vasodilators are NOt Currently Mapped in CLIF
+pulm_vaso <- c('R JHM IP RT NO2 (PPM)',
+               'R JHM IP RT EPOPROSTENOL DOSE',
+               'R JHM IP RT NO MEASURED (PPM)',
+               'R JHH IP RT EPOPROSTENOL  RATE (ML/HR)')
+inhaled_pvd <- open_dataset(paste0(ccrd_data, '/resp_flowsheet')) |> 
+  filter(pat_enc_csn_id %in% temp_times$hospitalization_id) |>
+  filter(meas_name %in% pulm_vaso) |>
+  rename(patient_id = cohort_id,
+         hospitalization_id = pat_enc_csn_id,
+         recorded_dttm = recorded_time) |>
+  left_join(temp_times) |>
+  collect() |>
+  #Put into UTC (how CLIF tables are stored)
+  mutate(recorded_dttm=force_tz(recorded_dttm, tzone = 'America/New_York'),
+         recorded_dttm=as.POSIXct(recorded_dttm, tzone = 'UTC'),
+         numeric_value=as.numeric(meas_value)) |>
+  #Filter to 36 Hour Window After t_proseva_first
+  filter(numeric_value!=0 &
+           recorded_dttm>=t_proseva_first &
+           recorded_dttm<t_proseva_first+dhours(36)) |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  mutate(pulmvaso_during_eligibility=1,
+         pulmvaso_name=fcase(
+           grepl('NO2|NO ', meas_name, ignore.case=T), 'NitricOxide',
+           grepl('epo', meas_name, ignore.case=T), 'Epoprostenol'
+         )) |>
+  select(patient_id, encounter_block, pulmvaso_during_eligibility, pulmvaso_name)
+
+#Merge Back with PROSEVA Prone
+proseva_prone_table <- proseva_prone_table |>
+  left_join(nmb) |>
+  left_join(inhaled_pvd) |>
+  mutate(nmb_during_eligibility=fifelse(is.na(nmb_during_eligibility), 0, nmb_during_eligibility),
+         pulmvaso_during_eligibility=fifelse(is.na(pulmvaso_during_eligibility), 0, pulmvaso_during_eligibility))
+
+```
+
+
+
+```{r Merge in ECMO Start}
+#Those Who are Placed on ECMO Before t_enrollment are not Eligible for This Study
+#Need to Use CCRD Table (not built in CLIF at time of this writing)
+ecmo_summary <- open_dataset(paste0(ccrd_data, 'ecmo_summary')) |>
+  fn.utc_timezone() |>
+  rename(patient_id = cohort_id,
+         hospitalization_id = pat_enc_csn_id) |>
+  left_join(cohort_ids) |>
+  filter(in_cohort==1) |>
+  collect() |>
+  mutate(ecmo_duration_hours=ecmo_duration_days/dhours(1)) |>
+  filter(ecmo_duration_hours>0) |>
+  select(-in_cohort, -hospitalization_id) |>
+  #Select First Episode Only
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, ecmo_start) |>
+  filter(row_number()==1) |>
+  ungroup()
+```
+
+```{r Record Baseline Compliance}
+#Use First Compliance Recorded After Ventilator Start
+temp_times <- vent_eligible |> select(patient_id, encounter_block, vent_episode_start, vent_episode_end) |>
+  left_join(cohort_ids)
+
+#Get CLIF Respiratory Filtered to The First 48 Hours of Vent Times
+compliance_tv <- clif_respiratory_support |>
+  filter(hospitalization_id %in% temp_times$hospitalization_id) |>
+  left_join(temp_times) |>
+  collect() |>
+  filter(recorded_dttm>=vent_episode_start & recorded_dttm<=vent_episode_end) |>
+  filter(recorded_dttm<=vent_episode_start+dhours(48)) |>
+  #Filter Out Periods on ECMO
+  left_join(ecmo_summary) |>
+  filter(is.na(ecmo_start) | is.na(ecmo_end) | (recorded_dttm<=ecmo_start | recorded_dttm>=ecmo_end))
+
+summary(compliance_tv$tidal_volume_set)
+summary(compliance_tv$plateau_pressure_obs)
+summary(compliance_tv$peep_set)
+
+#Make Outliers NA
+compliance_tv <- compliance_tv |>
+  mutate(tidal_volume_set=fifelse(
+            tidal_volume_set<=100 | tidal_volume_set>=1000, NaN, tidal_volume_set),
+         peep_set=fifelse(
+          peep_set<0 | peep_set>=35, NaN, peep_set),
+         plateau_pressure_obs=fifelse(
+          plateau_pressure_obs<=5 | plateau_pressure_obs>=80, NaN, plateau_pressure_obs
+        ))
+
+summary(compliance_tv$tidal_volume_set)
+hist(compliance_tv$tidal_volume_set)
+summary(compliance_tv$plateau_pressure_obs)
+hist(compliance_tv$plateau_pressure_obs)
+summary(compliance_tv$peep_set)
+hist(compliance_tv$peep_set)
+
+#Mark Eligible Vent Modes for LPV Assessment
+eligible_modes <- c('Assist Control-Volume Control', 'Pressure Control', 'Pressure-Regulated Volume Control', 'SIMV')
+tv_set_mode <- c('Assist Control-Volume Control', 'Pressure-Regulated Volume Control', 'SIMV')
+tv_exhaled_mode <- c('Pressure Control')
+
+compliance_tv <- compliance_tv |>
+  group_by(patient_id, encounter_block) |>
+  arrange(patient_id, encounter_block, recorded_dttm) |>
+  fill(device_category, mode_category, mode_name, .direction = 'downup') |>
+  group_by(patient_id, encounter_block, mode_category) |>
+  fill(peep_set, .direction = 'downup') |>
+  ungroup() |>
+  #Plateau Pressure Has to be At Least Greater Than PEEP SEt
+  mutate(plateau_pressure_obs=fifelse(plateau_pressure_obs<=peep_set, NaN, plateau_pressure_obs)) |>
+  mutate(eligible_measure=fifelse(mode_category %in% eligible_modes, 1, 0)) |>
+  group_by(patient_id, encounter_block) |>  
+  mutate(no_eligible=fifelse(sum(eligible_measure, na.rm=T)==0, 1, 0)) |>
+  filter(eligible_measure==1 | no_eligible==1) |>
+  mutate(tv_measure = fcase(
+    mode_category %in% tv_set_mode, tidal_volume_set,
+    mode_category %in% tv_exhaled_mode, tidal_volume_obs)) |>
+  group_by(patient_id, encounter_block, mode_category) |>
+  fill(tv_measure, .direction ='downup') |>
+  ungroup() |>
+  mutate(driving_pressure_static=plateau_pressure_obs-peep_set,
+         driving_pressure_dynamic=peak_inspiratory_pressure_obs-peep_set,
+         compliance_static=tv_measure/driving_pressure_static,
+         compliance_dynamic=tv_measure/driving_pressure_dynamic,
+         keep_cat_static=fifelse(!is.na(compliance_static), 1, 0),
+         keep_cat_dynamic=fifelse(!is.na(compliance_dynamic), 1, 0)) |>
+  group_by(patient_id, encounter_block, keep_cat_static) |>
+  mutate(bl_driving_pressure_static=fifelse(row_number()==1 & keep_cat_static==1, driving_pressure_static, NaN),
+         bl_compliance_static=fifelse(row_number()==1 & keep_cat_static==1, compliance_static, NaN)) |>
+  group_by(patient_id, encounter_block, keep_cat_dynamic) |>
+  mutate(bl_driving_pressure_dynamic=fifelse(row_number()==1 & keep_cat_dynamic==1, driving_pressure_dynamic, NaN),
+         bl_compliance_dynamic=fifelse(row_number()==1 & keep_cat_dynamic==1, compliance_dynamic, NaN)) |>
+  ungroup() |>
+  mutate(bl_tidal_volume=fifelse(
+          !is.na(bl_driving_pressure_static), tv_measure, NaN),
+         bl_tidal_volume=fifelse(is.na(bl_tidal_volume) & !is.na(bl_driving_pressure_dynamic), tv_measure, bl_tidal_volume),
+         tv_missing=fifelse(is.na(tv_measure), 1, 0)) |>
+  group_by(patient_id, encounter_block, tv_missing) |>
+  mutate(bl_tidal_volume=fifelse(is.na(bl_tidal_volume) & tv_missing==0 & row_number()==1, tv_measure, bl_tidal_volume)) |>
+  ungroup() |>
+  group_by(patient_id, encounter_block) |>
+  fill(bl_driving_pressure_static, bl_driving_pressure_dynamic, bl_compliance_static, bl_compliance_dynamic, bl_tidal_volume, .direction = 'downup') |>
+  filter(row_number()==1) |>
+  select(patient_id, encounter_block, bl_driving_pressure_static, 
+         bl_compliance_static, bl_driving_pressure_dynamic, 
+         bl_compliance_dynamic, bl_tidal_volume ) |>
+  ungroup()
+
+#Merge with Proseva Prone Table
+proseva_prone_table <- proseva_prone_table |>
+  left_join(compliance_tv)
+```
+
+
+
+```{r Define ICU Location, Hospital Location and Whether in OR Prior to Enrollment}
+temp_enrollment <- proseva_prone_table |>
+  select(patient_id, encounter_block, t_enrollment, t_proseva_first) |>
+  left_join(vent_times) |>
+  mutate(t_enrollment=fifelse(
+    is.na(t_enrollment), t_proseva_first, t_enrollment
+  )) |>
+  select(patient_id, encounter_block, t_enrollment)
+
+#What Hospital is the Patient at When t_enrollment Occurs
+#What ICU is the Patient in When t_enrollment Occurs
+#Was the Patient in a Procedural Area In the 48-hours Prior to t_enrollment?
+hospital_location <- clif_adt |>
+  left_join(cohort_ids) |>
+  filter(in_cohort==1) |>
+  left_join(temp_enrollment) |>
+  filter(!is.na(t_enrollment)) |>
+  arrange(patient_id, encounter_block, in_dttm) |>
+  collect() |>
+  mutate(enrollment_icu=fifelse(
+    as.POSIXct(t_enrollment)>=as.POSIXct(in_dttm) &
+      as.POSIXct(t_enrollment)<=as.POSIXct(out_dttm) &
+      location_category=='icu', 1, 0
+  )) |>
+  #If the Patient Meets Criteria in an ED or Procedural Area Take the First ICU Location After This Row
+  group_by(patient_id, encounter_block) |>
+  #Number the Rows
+  mutate(location_count=row_number()) |>
+  #Identify Location Category of the Current 'enrollment_icu'
+  mutate(temp_category=fcase(
+   enrollment_icu==1, location_category
+  )) |>
+  mutate(temp_count=fcase(
+    enrollment_icu==1, location_count
+  )) |>
+  fill(temp_category, temp_count, .direction = 'updown') |>
+  ungroup() |>
+  mutate(before_enrollment=fifelse(
+    as.POSIXct(t_enrollment)>as.POSIXct(out_dttm), 1, 0
+  )) |>
+  group_by(patient_id, encounter_block, before_enrollment) |>
+  mutate(temp_count=fifelse(
+    before_enrollment==0, row_number(), NaN)) |>
+  #Make non-ICU locations NA
+  mutate(temp_count=fifelse(
+    location_category %!in% c('icu'), NaN, temp_count
+  )) |>
+  #If the Patient t_enrollment wasn't in an ICU, take the first icu after this
+  group_by(patient_id, encounter_block) |>
+  mutate(enrollment_icu=fifelse(
+    temp_category %!in% c('icu') & 
+      temp_count==min(temp_count, na.rm=TRUE), 1, enrollment_icu
+  )) |>
+  mutate(temp_category=fcase(
+   enrollment_icu==1, location_category
+  )) |>
+  fill(temp_category, .direction = 'updown') |>
+   #If the Patient t_enrollment still wasn't in an ICU, take the first stepdown after this
+  group_by(patient_id, encounter_block, before_enrollment) |>
+  mutate(temp_count=fifelse(
+    before_enrollment==0, row_number(), NaN)) |>
+  #Make non-ICU locations NA
+  mutate(temp_count=fifelse(
+    location_category %!in% c('stepdown'), NaN, temp_count
+  )) |>
+  group_by(patient_id, encounter_block) |>
+  mutate(enrollment_icu=fifelse(
+    temp_category %!in% c('icu') & 
+      temp_count==min(temp_count, na.rm=TRUE), 1, enrollment_icu
+  )) |>
+  mutate(enrollment_icu=fcase(
+    enrollment_icu==1, location_name
+  )) |>
+  #2 Patients in Weinberg 5C and Called a Ward, but it is not
+  mutate(enrollment_icu=fifelse(
+    is.na(enrollment_icu) & location_name=='JHH WEINBERG 5C', location_name, enrollment_icu
+  )) |>
+ #Finally Fill In Enrollment ICU and Hospital ID
+ mutate(hospital_id=fifelse(location_name==enrollment_icu, hospital_id, NA_character_)) |>
+ fill(enrollment_icu, hospital_id, .direction = 'updown') |>
+  #Define If Patient was in the OR 24 Hours Prior to Enrollment
+  mutate(or_before_enrollment=fifelse(
+    tolower(location_category) =='procedural' & 
+      as.POSIXct(in_dttm)>=as.POSIXct(t_enrollment)-ddays(1) &
+      as.POSIXct(in_dttm)<=as.POSIXct(t_enrollment) & 
+      #Need to Further Define Operating Room in Distinctionfrom Endoscopy Periop
+      grepl('op', location_name, ignore.case=T) & 
+      !grepl('endo', location_name, ignore.case=T), 1, 0
+  )) |>
+  group_by(patient_id, encounter_block) |>
+  mutate(or_before_enrollment=max(or_before_enrollment, na.rm = TRUE)) |>
+  filter(enrollment_icu==location_name) |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(patient_id, hospitalization_id, encounter_block, enrollment_icu, hospital_id, or_before_enrollment) 
+
+#Exact Hospitalization IDs (Rather than Encounter Block - This is For Defining Primary Diagnosis)
+exact_hosp_id <- hospital_location |> select(patient_id, hospitalization_id, encounter_block) |>
+  mutate(this_id=1)
+
+hospital_location <- hospital_location |> select(-hospitalization_id)
+
+rm(temp_enrollment)
+```
+
+```{r Extract Covariates}
+#Age and Discharge Status
+hosp_dispo <- clif_hospitalization |>
+  filter(hospitalization_id %in% cohort_ids$hospitalization_id) |>
+  select(patient_id, encounter_block, age_at_admission, final_admission_dttm, final_discharge_dttm, final_discharge_category) |> 
+  mutate(inhosp_death=if_else(final_discharge_category=='Expired', 1, 0),
+    dc_hospice=if_else(final_discharge_category=='Hospice', 1, 0)) |>
+  collect() |>
+  group_by(patient_id, encounter_block) |>
+  filter(row_number()==1) |>
+  ungroup()
+
+#Gender and Race
+patient <- clif_patient |>
+  filter(patient_id %in% enc_blocks$patient_id) |>
+  mutate(female=if_else(sex_category=='Female', 1, 0)) |>
+  select(patient_id, female, race_category, ethnicity_category) |> 
+  collect() |>
+  mutate(race_ethnicity=fcase(
+    tolower(race_category)=="white" & 
+      tolower(ethnicity_category) %in% c('non-hispanic'), 'White, non-Hispanic',
+    tolower(ethnicity_category)=='hispanic', 'Hispanic',
+    tolower(race_category)=='black or african american' & 
+      tolower(ethnicity_category) %in% c('non-hispanic'), 'Black, non-Hispanic',
+    tolower(race_category)=='asian', 'Asian',
+    default='unknown')) |>
+  group_by(patient_id) |>
+  filter(row_number()==n()) |>
+  ungroup()
+
+#Do this At the Patient Level so that Missingness is Minimzed (can use height closest to proning)
+#First Need Cohort_Times
+#Will Use Cohort_ids, but Also a Table of Vent Times and t_enrollment
+temp <- hosp_dispo |> select(patient_id, encounter_block, final_admission_dttm, final_discharge_dttm)
+cohort_times <- proseva_prone_table |>
+  left_join(vent_eligible %>% select(patient_id, encounter_block, vent_episode_start, vent_episode_end)) |>
+  select(patient_id, encounter_block, t_enrollment, vent_episode_start, vent_episode_end) |>
+  left_join(temp) 
+rm(temp)
+#Now BMI
+bmi <- clif_vitals |>
+  filter(vital_category %in% c('weight_kg', 'height_cm')) |>
+  filter(hospitalization_id %in% cohort_ids$hospitalization_id) |>
+  #Filter Outliers
+  filter((vital_category=='height_cm' & vital_value>=76.2 & vital_value<=244) |
+           (vital_category=='weight_kg' & vital_value>=20 & vital_value<=1100)) |>
+  left_join(cohort_ids) |>
+  left_join(cohort_times) |> #This Works Because There Are No Patients with > 1 encounter
+  collect() |>
+  #Pick Height and Weight Closest to VEnt_episode Start
+  #First Calculate Time Difference
+  mutate(time_diff=as.duration(as.POSIXct(vent_episode_start)-as.POSIXct(recorded_dttm))/dhours(1)) |>
+  #Define if Before or After t_entrollment
+  mutate(before_enrollment=fifelse(time_diff>=0, 1, 0)) |>
+  group_by(patient_id, encounter_block, before_enrollment, vital_category) |> #With this Grouping You keep Closest Before and After t_entrollment
+  mutate(keep=fifelse(
+    abs(time_diff)==min(abs(time_diff)), 1, 0
+  )) |>
+  filter(keep==1) |>
+  #Now Select Height/Weight (Preferrably This is Prior to Enrollment)
+  group_by(patient_id, encounter_block) |>
+  mutate(study_height_cm=fcase(
+    keep==1 & before_enrollment==1 & vital_category=='height_cm', vital_value
+  )) |>
+  mutate(study_weight_kg=fcase(
+    keep==1 & before_enrollment==1 & vital_category=='weight_kg', vital_value
+  )) |>
+  fill(study_height_cm, study_weight_kg, .direction = 'downup') |>
+  #IF missing Can Use First Value After Enrollment
+  mutate(study_height_cm=fifelse(
+    is.na(study_height_cm) & keep==1 & 
+      before_enrollment==0 & vital_category=='height_cm', 
+    vital_value, study_height_cm
+  )) |>
+  mutate(study_weight_kg=fifelse(
+    is.na(study_weight_kg) &  keep==1 & before_enrollment==0 & vital_category=='weight_kg', 
+    vital_value, study_weight_kg
+  )) |>
+  fill(study_height_cm, study_weight_kg, .direction = 'downup') |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  #Calculate BMI
+  mutate(bmi=study_weight_kg/((study_height_cm/100)^2)) |>
+  select(patient_id, encounter_block, vent_episode_start, vent_episode_end, study_height_cm, study_weight_kg, bmi)
+```
+
+```{r Bring in Elixhauser Comorbidities}
+#NOT USED in Classifier; Currently Only Mapped in JH-CCRD (not CLIF, but coming soon)
+encounter_blocks <- ards_reviewed |>
+  select(patient_id, encounter_block, hospitalization_id) 
+
+elixhauser <- open_dataset(paste0(ccrd_data, 'elixhauser_index_output.parquet')) |>
+  rename(hospitalization_id = pat_enc_csn_id) |>
+  filter(hospitalization_id %in% ards_reviewed$hospitalization_id) |>
+  left_join(encounter_blocks) |>
+  collect() |>
+  rowwise() |>
+  mutate(elixhauser_count = sum(c_across(CMR_AIDS:CMR_WGHTLOSS), na.rm = TRUE)) |>
+  ungroup() |>
+  select(patient_id, encounter_block, 
+         CMR_VERSION:CMR_Index_Mortality, elixhauser_count) |>
+  distinct()
+```
+
+```{r Bring in COVID Tests}
+#SARS COV2 and Influenza Positivity - Do this At Patient Level Anytime in the 4 Weeks Prior to t_enrollment
+sars_cov2 <- clif_microbiology_nonculture |>
+  filter(patient_id %in% cohort_times$patient_id) |>
+  select(-hospitalization_id) |> #Want to Merge on Patient Level
+  filter(micro_category %in% c('sars_cov2_pcr', 'sars_cov2_antigen', 'sars_cov2_na', 'influenza_pcr', 'influenza_antigen')) |>
+  #left_join(cohort_ids) |> #Merges in Encounter Block
+  left_join(cohort_times) |>
+  collect() |>
+  filter(lab_collect_dttm<=vent_episode_start+ddays(5) & lab_collect_dttm>=vent_episode_start-dweeks(4)) |>
+  mutate(covid_flu=fifelse(
+    grepl('sars', micro_category, ignore.case=T), 'sars_cov2', 'influenza'
+  )) |>
+  group_by(patient_id, vent_episode_start, covid_flu) |>
+  mutate(sars_cov2_positive=fifelse(
+    sum(tolower(result_category)=='detected', na.rm=TRUE)>=1, 1, 0),
+    sars_cov2_positive=fifelse(covid_flu=='sars_cov2', sars_cov2_positive, NaN),
+    influenza_positive=fifelse(
+       sum(tolower(result_category)=='detected', na.rm=TRUE)>=1, 1, 0),
+    influenza_positive=fifelse(covid_flu=='influenza', influenza_positive, NaN)) |>
+  group_by(patient_id, vent_episode_start) |>
+  fill(encounter_block, sars_cov2_positive, influenza_positive, .direction = 'updown') |>
+  filter(row_number()==1) |>
+  ungroup() |>
+  select(patient_id, encounter_block, sars_cov2_positive, influenza_positive)
+
+```
+
+```{r Now Build Final Cohort}
+ards_reviewed <- ards_reviewed |> select(-hospitalization_id)
+
+ards_classifier_cohort <- vent_eligible |>
+  left_join(proseva_prone_table) |>
+  left_join(ecmo_summary) |>
+  left_join(hospital_location) |>
+  left_join(hosp_dispo) |>
+  left_join(patient) |>
+  left_join(bmi) |>  
+  left_join(elixhauser) |>
+  left_join(sars_cov2) |>
+  left_join(ards_reviewed) |>
+  mutate(cohort_eligible=fifelse(
+    is.na(cohort_eligible), 0, cohort_eligible
+  )) |>
+  mutate(proned=fifelse(
+    is.na(proned), 0, proned
+  )) |>
+  #Define if There is an ECMO Exclusion
+  mutate(ecmo_exclusion=fcase(
+    !is.na(ecmo_start) & ecmo_start<=t_enrollment, 1,
+    default = 0
+  )) |>
+  #Define if Cardiac Arrest is Not the Primary Diagnosis
+  mutate(cardiac_arrest_primary_dx=fifelse(is.na(cardiac_arrest_primary_dx), 0, cardiac_arrest_primary_dx))
+
+#Before Filtering To Cohort Eligible, Keep Separate File of Proned Outside of Cohort
+proned_outside_cohort <- ards_classifier_cohort |>
+  filter((cohort_eligible==0 | or_before_enrollment==1 | 
+            ecmo_exclusion==1 | cardiac_arrest_primary_dx==1) & proned==1)
+cat('\n There were', length(unique(proned_outside_cohort$patient_id)), 'patients who did not meet the cohort criteria but were proned in the', site, 'cohort. \n')
+
+#Finally Filter Down to Final Eligible Cohort
+#Keep Track for Consort/Flow Diagrams
+n_patients <- length(unique(ards_classifier_cohort$patient_id))
+n_encounters <- dim(ards_classifier_cohort)[1]
+
+cat('\n', n_encounters, 'among', n_patients, 'patients with ventilator eligibility are in the ards classifier cohort and were reviewed for ARDS criteria')
+
+#Create Final Exclusion Dataset
+final_exclusions <- ards_classifier_cohort |>
+  filter(ecmo_exclusion==1 | or_before_enrollment==1 | cardiac_arrest_primary_dx==1)
+tab <- data.frame(
+    'Variable' = c('n', 'or_before_enrollment', 'cardiac arrest', 'ecmo_before_eligiblity', 
+                   'proned', 'proned24'),
+    'count' = c(dim(final_exclusions)[1], 
+              sum(final_exclusions$or_before_enrollment),
+              sum(final_exclusions$cardiac_arrest_primary_dx),
+              sum(final_exclusions$ecmo_exclusion),
+              sum(final_exclusions$proned),
+              sum(final_exclusions$prone_24hour_outcome))
+  )
+cat('\nSummary Table Showing Final Exclusions and Count of Proned Patients in This Group\n')
+tab
+
+#Recalculate Final Cohort Ids
+cohort_ids <- ards_classifier_cohort |>
+  select(patient_id, hospitalization_id, encounter_block) |>
+  mutate(in_cohort=1)
+
+#Generate a Table of ALL HOspitalization IDs (here this Deals with the 'Linked' Encounters)
+temp <- cohort_ids |> select(patient_id, encounter_block, in_cohort)
+cohort_hospitalization_ids <- clif_hospitalization |>
+  left_join(temp) |>
+  filter(in_cohort==1) |>
+  select(patient_id, hospitalization_id, encounter_block, in_cohort) |>
+  collect()
+rm(temp)
+
+write.csv(ards_classifier_cohort, paste0(project_location, '/data/ards_classifier_cohort.csv'))
+```
+
+
+

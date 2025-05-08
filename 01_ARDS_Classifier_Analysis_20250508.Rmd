@@ -1,0 +1,780 @@
+---
+title: "021ARDS_Classifier_Analysis"
+author: "Chad Hochberg"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Load Needed Libraries, include=FALSE}
+packages <- c("lubridate", 
+              "tidyverse", 
+              "tableone", 
+              "broom", 
+              "readr", 
+              "collapse",
+              "boot",
+              "data.table",
+              "psych") #For Kappa Statistics
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+rm(packages, install_if_missing)
+
+#Use Dplyr select as default
+select <- dplyr::select
+```
+
+```{r Project Location}
+project_location <- "~/workspace/Storage/chochbe1/persistent/K23_ARDS_Cohort/"
+setwd(project_location)
+```
+
+
+```{r Open Classifier Cohort and Create New Variables}
+ards_classifier_cohort <- read.csv(paste0(project_location, '/data/ards_classifier_cohort.csv')) |>
+  mutate(year=year(as.POSIXct(final_admission_dttm, tz = 'America/New_York'))) |>
+  filter(is.na(ecmo_type) | ecmo_type!='Veno-arterial (VA) ECMO') |>
+  mutate(or_before_enrollment=fifelse(is.na(t_proseva_first), 0, or_before_enrollment)) |>
+  mutate(academic_hospital=fifelse(hospital_id %in% c('JHH', 'BMC'), 1, 0),
+         ibw=fcase(
+           female==1, (45.5 + 2.3*((0.3927*study_height_cm)-60)),
+           female==0, (50 + 2.3*((0.3927*study_height_cm)-60))),
+         tv_pbw=bl_tidal_volume/ibw,
+         covid=fifelse(is.na(covid), 0, covid),
+         compliance_combined=fifelse(is.na(bl_compliance_static), bl_compliance_dynamic, bl_compliance_static),
+         ecmo_after_eligibility=fcase(is.na(ecmo_start), 0,
+                                ecmo_start>(as.POSIXct(t_proseva_first)+dhours(36)), 1,
+                                default = 0),
+         ecmo_during_eligibility=fcase(is.na(ecmo_start), 0,
+                                ecmo_start>=t_proseva_first & ecmo_start<(as.POSIXct(t_proseva_first)+dhours(36)), 1,
+                                default = 0)) |>
+  #Mark SarsCOV2 and Influenza as 0 if missing (means no positive test identified)
+  mutate(
+    sars_cov2_positive=fifelse(is.na(sars_cov2_positive), 0, sars_cov2_positive),
+    influenza_positive=fifelse(is.na(influenza_positive), 0, influenza_positive),
+    prone_after_eligibility=fcase(
+      cohort_eligible==1 & !is.na(t_proseva_second) & first_prone_time>t_proseva_second, 1,
+      cohort_eligible==1 & eligible_by_prone==0 & proned==1, 1,
+      cohort_eligible==0 & first_prone_time>=t_proseva_first, 1, 
+      default = 0),
+    eligible_by_hypoxemia_intervention=fifelse(
+      eligible_by_proseva==0 & !is.na(t_proseva_first) &
+        (eligible_by_prone==1 | nmb_during_eligibility==1 | pulmvaso_during_eligibility==1), 1, 0
+    ))
+
+cat(
+  "\nThere were",
+  sum(is.na(ards_classifier_cohort$t_proseva_first)),
+  "encounters without a PF ratio meeting initial criteria and are excluded\n"
+)
+
+ards_classifier_cohort <- ards_classifier_cohort |> filter(!is.na(t_proseva_first))
+```
+
+```{r Sequential Classifier Definitions}
+ards_classifier_cohort <- ards_classifier_cohort |>
+  #For those that in this run didn't have qualifying first pf ratio mark pulmvaso and nmb as 0 (they never qualify)
+  mutate(
+    pulmvaso_during_eligibility=fifelse(is.na(t_proseva_first), 0, pulmvaso_during_eligibility),
+    nmb_during_eligibility=fifelse(is.na(t_proseva_first), 1, nmb_during_eligibility)) |>
+  #If Adjudicated ARDS==1 or 2 (meaning reviewers agreed or 1 thought ARDS)
+  mutate(ards_def1=fifelse(adjudicated_ards==1 | adjudicated_ards==2, 1, 0),
+         #Now Only if Both Reviewers (when there Were 2) Agreed
+         ards_def2=fifelse(adjudicated_ards==1, 1, 0)) |>
+  mutate(cohort_eligible_def1=
+             fifelse((cohort_eligible==1 | pulmvaso_during_eligibility==1 | nmb_during_eligibility==1), 1, cohort_eligible),
+         cohort_eligible_def2=fifelse(or_before_enrollment==1, 0, cohort_eligible_def1),
+         cohort_eligible_def3=fifelse(eligible_by_proseva==1 & or_before_enrollment==0, 1, 0),
+         cohort_eligible_def4=
+             fifelse((cohort_eligible_spo2==1 | pulmvaso_during_eligibility==1 | nmb_during_eligibility==1), 1, cohort_eligible_spo2),
+         cohort_eligible_def5=fifelse(or_before_enrollment==1, 0, cohort_eligible_def4),
+         cohort_eligible_def6=fifelse((or_before_enrollment==1 | cardiac_arrest_primary_dx==1), 0, cohort_eligible_def4),
+         cohort_eligible_def7=fifelse((cohort_eligible_def1==1 | cohort_eligible_def4==1), 1, 0),
+         cohort_eligible_def8=fifelse(or_before_enrollment==1, 0, cohort_eligible_def7),
+         cohort_eligible_def9=fifelse((or_before_enrollment==1 | cardiac_arrest_primary_dx==1), 0, cohort_eligible_def7))
+
+readable_labels <- c(
+  cohort_eligible_def1 = "Peristent Hypoxemia by PF or Hypoxemia Intervention",
+  cohort_eligible_def2 = "Peristent Hypoxemia by PF or Hypoxemia Intervention: \n   Exclude OR in prior 24 hours",
+  cohort_eligible_def3 = "Peristent Hypoxemia by PF Only (Exclude OR):",
+  cohort_eligible_def4 = "Peristent Hypoxemia by SF or Hypoxemia Intervention",
+  cohort_eligible_def5 = "Peristent Hypoxemia by SF or Hypoxemia Intervention: \n   Exclude OR",
+  cohort_eligible_def6 = "Peristent Hypoxemia by SF or Hypoxemia Intervention: \n   Exclude OR and/or Cardiac ARrest",
+  cohort_eligible_def7 = "Peristent Hypoxemia by PF or SF or Hypoxemia Intervention",
+  cohort_eligible_def8 = "Peristent Hypoxemia by PF or SF or Hypoxemia Intervention: \n   Exclude OR in prior 24 hours",
+  cohort_eligible_def9 = "Peristent Hypoxemia by PF or SF or Hypoxemia Intervention: \n   Exclude OR or Cardiac Arrest"
+)
+```
+
+```{r Exclude OR Cases Here After Describing ARDS Prevalance}
+df <- ards_classifier_cohort |>
+  filter(or_before_enrollment==1)
+cat('\nThere were', dim(df)[1], 'in OR in 24 Hours Prior to Enrollment:\n')
+tab <- table(
+    `Clinician ARDS` = df$ards_def1,
+    `Classifier ARDS` = df$cohort_eligible_def1
+  )
+# Print raw table
+cat('\nContingency Table In Population in OR in 24 Hours Prior to Enrollment:\n')
+print(tab)
+# Print column-wise proportions
+cat('\nProportions by Classifier ARDS in Population in OR (column):\n')
+print(prop.table(tab, margin = 2))
+
+#Drop OR Prior to Enrollment
+ards_classifier_cohort <- ards_classifier_cohort |>
+  filter(or_before_enrollment==0)
+```
+
+
+```{r Table 1: Describe Cohort}
+to_tab <-c(
+  'age_at_admission',
+  'female',
+  'race_ethnicity',
+  'bmi',
+  'elixhauser_count',
+  'academic_hospital',
+  'sars_cov2_positive', 
+  'influenza_positive',
+  'covid',
+  'first_proseva_pf',
+  'sf_ratio_second',
+  'bl_compliance_static',
+  'bl_compliance_dynamic',
+  'compliance_combined',
+  'tv_pbw',
+  'first_proseva_fio2',
+  'first_proseva_peep',
+  'eligible_by_hypoxemia_intervention', 
+  'prone_after_eligibility',
+  'nmb_during_eligibility',
+  'pulmvaso_during_eligibility',
+  'eligible_by_prone',
+  'ecmo_during_eligibility',
+  'ecmo_after_eligibility',
+  'inhosp_death',
+  'dc_hospice',
+  'year'
+)
+
+factors_tab <- c(
+  'female',
+  'race_ethnicity',
+  'academic_hospital',
+  'sars_cov2_positive', 
+  'influenza_positive',
+  'covid',
+  'eligible_by_hypoxemia_intervention', 
+  'prone_after_eligibility',
+  'nmb_during_eligibility',
+  'pulmvaso_during_eligibility',
+  'eligible_by_prone',
+  'ecmo_during_eligibility',
+  'ecmo_after_eligibility',
+  'inhosp_death',
+  'dc_hospice',
+  'year'
+)
+
+nonnorm_tab <- c(
+  'age_at_admission',
+  'bmi',
+  'elixhauser_count',
+  'first_proseva_pf',
+  'sf_ratio_second',
+  'bl_compliance_static',
+  'bl_compliance_dynamic',
+  'compliance_combined',
+  'tv_pbw',
+  'first_proseva_fio2',
+  'first_proseva_peep'
+)
+
+tab1 <- CreateTableOne(vars = to_tab, data = ards_classifier_cohort, factorVars = factors_tab )
+summary(tab1)
+tab1 <- CreateTableOne(vars = to_tab, strata="cohort_eligible_def2", data=ards_classifier_cohort, factorVars = factors_tab, addOverall = TRUE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_ehr_classifier.csv")
+rm(tab1_excel)
+
+tab1 <- CreateTableOne(vars = to_tab, strata="ards_def1", data=ards_classifier_cohort, factorVars = factors_tab, addOverall = F)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_adjudicated_ards.csv")
+rm(tab1_excel)
+
+tab1 <- CreateTableOne(vars = to_tab, strata="year", data=ards_classifier_cohort, factorVars = factors_tab, addOverall = F)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_by_year.csv")
+rm(tab1_excel)
+
+```
+
+```{r Describe ARDS Classification}
+to_tab <- c(
+  'ards_def1', 
+  'ards_def2',
+  'two_reviews',
+  'rev1_2_agree'
+)
+
+factors_tab <- c(
+  'ards_def1', 
+  'ards_def2',
+  'two_reviews',
+  'rev1_2_agree'
+)
+
+tab2 <- CreateTableOne(vars = to_tab, strata="year", data=ards_classifier_cohort, factorVars = factors_tab, addOverall = T)
+print(tab2, nonnormal=nonnorm_tab)
+tab2_excel <- print(tab2, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab2_excel, file="tables/table_ardsclassification_by_year.csv")
+rm(tab2_excel)
+
+#Kappa Statistic Where there Were Two Reviewers
+raters <- ards_classifier_cohort |>
+  filter(two_reviews==1) |>
+  select(ards_dx_berlin_1, ards_dx_berlin_2)
+cohen.kappa(raters)
+```
+
+
+```{r Two by Two Tables for Each Definition}
+ppv_table <- function(data, ards_col = 'ards_def1', eligible_col = 'cohort_eligible_def1') {
+  # Use [[ ]] to access columns dynamically
+  tab <- table(
+    `Clinician ARDS` = data[[ards_col]],
+    `Classifier ARDS` = data[[eligible_col]]
+  )
+  
+  # Print raw table
+  cat('\nContingency Table:\n')
+  print(tab)
+  
+  # Print column-wise proportions
+  cat('\nProportions by Classifier ARDS (column):\n')
+  print(prop.table(tab, margin = 2))
+  
+  return(invisible(tab))
+}
+
+eligible_defs <- paste0("cohort_eligible_def", 1:9)
+
+cat('\n Performance Characteristics USing Primary Definitions \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(ards_classifier_cohort, ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics When Excluding Cases with Reviewer Disagreement \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           ards_def1==ards_def2), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics in COVID/Influenza \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           sars_cov2_positive==1 | influenza_positive==1), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics in COVID/Influenza Negative \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           sars_cov2_positive==0 & influenza_positive==0), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics in 2021 \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           year==2021), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics in 2022 \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           year==2022), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics in 2022 \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           year==2023), ards_col = "ards_def1", eligible_col = edef)
+}
+
+cat('\n Performance Characteristics Medical ICU Only \n')
+for (edef in eligible_defs) {
+  cat("\n==", readable_labels[[edef]], "==\n")
+  ppv_table(
+    subset(ards_classifier_cohort, 
+           hospital_id %in% c('JHH', 'BMC')), ards_col = "ards_def1", eligible_col = edef)
+}
+```
+
+
+
+```{r Use Bootstrap Method to Calculate Confidence Intervals}
+# A function to calculate Performance metrics from Data Frame in Boostrapp
+# Define the bootstrap function to compute the four metrics for each resample.  
+# This function calculates sensitivity, specificity, PPV, and NPV.  
+metrics_fn <- function(data, index, ards_col = "ards_def1", eligible_col = "cohort_eligible_def2") {  
+  d <- data[index, ]  
+  
+  # Convert column names to symbols and evaluate them  
+  ards <- d[[ards_col]]  
+  eligible <- d[[eligible_col]]  
+  
+  tab <- table(eligible, ards)  
+  
+  # Check if we have all necessary categories  
+  if (!all(c("1", "0") %in% rownames(tab))) return(c(ppv = NA, npv = NA, sens = NA, spec = NA))  
+  if (!all(c("1", "0") %in% colnames(tab))) return(c(ppv = NA, npv = NA, sens = NA, spec = NA))  
+  
+  # Extract all values from confusion matrix  
+  TP <- tab["1", "1"]  
+  FP <- tab["1", "0"]  
+  TN <- tab["0", "0"]  
+  FN <- tab["0", "1"]  
+  
+  # Calculate metrics with error handling  
+  ppv <- if ((TP + FP) > 0) TP / (TP + FP) else NA  
+  npv <- if ((TN + FN) > 0) TN / (TN + FN) else NA  
+  sensitivity <- if ((TP + FN) > 0) TP / (TP + FN) else NA  
+  specificity <- if ((TN + FP) > 0) TN / (TN + FP) else NA  
+  
+  # Return all metrics as a named vector  
+  return(c(  
+    ppv = ppv,  
+    npv = npv,  
+    sens = sensitivity,  
+    spec = specificity  
+  ))  
+}  
+
+eligible_defs <- paste0("cohort_eligible_def", 1:9)
+set.seed(32284)
+boot_results <- lapply(eligible_defs, function(eligible_col) {
+  boot(
+    data = ards_classifier_cohort,
+    statistic = function(data, index) metrics_fn(data, index, ards_col = "ards_def1", eligible_col = eligible_col),
+    R = 1000
+  )
+})
+names(boot_results) <- readable_labels
+
+
+metric_names <- c("PPV", "NPV", "Sensitivity", "Specificity")  
+ci_results <- list()  
+
+for (eligible_def in names(boot_results)) {  
+  boot_obj <- boot_results[[eligible_def]]  
+  metric_ci <- list()  
+  
+  for (i in 1:length(metric_names)) {  
+    # Extract percentile confidence interval for metric i  
+    ci <- boot.ci(boot_obj, type = "perc", index = i)  
+    metric_ci[[metric_names[i]]] <- list(  
+      est = boot_obj$t0[i],  
+      lower = ci$perc[4],  
+      upper = ci$perc[5]  
+    )  
+  }  
+  
+  ci_results[[eligible_def]] <- metric_ci  
+}  
+
+ppv_ci_df <- data.frame(  
+  Classifier = character(0),  
+  PPV = numeric(0),  
+  PPV_lower = numeric(0),  
+  PPV_upper = numeric(0),  
+  NPV = numeric(0),  
+  NPV_lower = numeric(0),  
+  NPV_upper = numeric(0),  
+  Sensitivity = numeric(0),  
+  Sensitivity_lower = numeric(0),  
+  Sensitivity_upper = numeric(0),  
+  Specificity = numeric(0),  
+  Specificity_lower = numeric(0),  
+  Specificity_upper = numeric(0),  
+  stringsAsFactors = FALSE  
+)  
+
+for (eligible_def in names(ci_results)) {  
+  res <- ci_results[[eligible_def]]  
+  ppv_ci_df <- rbind(ppv_ci_df, data.frame(  
+    Classifier = eligible_def,  
+    PPV = res[["PPV"]][["est"]],  
+    PPV_lower = res[["PPV"]][["lower"]],  
+    PPV_upper = res[["PPV"]][["upper"]],  
+    NPV = res[["NPV"]][["est"]],  
+    NPV_lower = res[["NPV"]][["lower"]],  
+    NPV_upper = res[["NPV"]][["upper"]],  
+    Sensitivity = res[["Sensitivity"]][["est"]],  
+    Sensitivity_lower = res[["Sensitivity"]][["lower"]],  
+    Sensitivity_upper = res[["Sensitivity"]][["upper"]],  
+    Specificity = res[["Specificity"]][["est"]],  
+    Specificity_lower = res[["Specificity"]][["lower"]],  
+    Specificity_upper = res[["Specificity"]][["upper"]],  
+    stringsAsFactors = FALSE  
+  ))  
+}  
+print(ppv_ci_df)
+write.csv(ppv_ci_df, paste0(project_location, 'tables/metrics_primary.csv'))
+```
+
+```{r Repeat Bootstrapping In Subgroups}
+boot_results <- lapply(eligible_defs, function(eligible_col) {
+  boot(
+    data = subset(ards_classifier_cohort, ards_def1==ards_def2),
+    statistic = function(data, index) metrics_fn(data, index, ards_col = "ards_def1", eligible_col = eligible_col),
+    R = 1000
+  )
+})
+names(boot_results) <- readable_labels
+
+for (eligible_def in names(boot_results)) {  
+  boot_obj <- boot_results[[eligible_def]]  
+  metric_ci <- list()  
+  
+  for (i in 1:length(metric_names)) {  
+    # Extract percentile confidence interval for metric i  
+    ci <- boot.ci(boot_obj, type = "perc", index = i)  
+    metric_ci[[metric_names[i]]] <- list(  
+      est = boot_obj$t0[i],  
+      lower = ci$perc[4],  
+      upper = ci$perc[5]  
+    )  
+  }  
+  
+  ci_results[[eligible_def]] <- metric_ci  
+}  
+
+ppv_ci_df_rev_agree <- data.frame(  
+  Classifier = character(0),  
+  PPV = numeric(0),  
+  PPV_lower = numeric(0),  
+  PPV_upper = numeric(0),  
+  NPV = numeric(0),  
+  NPV_lower = numeric(0),  
+  NPV_upper = numeric(0),  
+  Sensitivity = numeric(0),  
+  Sensitivity_lower = numeric(0),  
+  Sensitivity_upper = numeric(0),  
+  Specificity = numeric(0),  
+  Specificity_lower = numeric(0),  
+  Specificity_upper = numeric(0),  
+  stringsAsFactors = FALSE  
+)  
+
+for (eligible_def in names(ci_results)) {  
+  res <- ci_results[[eligible_def]]  
+  ppv_ci_df_rev_agree <- rbind(ppv_ci_df_rev_agree, data.frame(  
+    Classifier = eligible_def,  
+    PPV = res[["PPV"]][["est"]],  
+    PPV_lower = res[["PPV"]][["lower"]],  
+    PPV_upper = res[["PPV"]][["upper"]],  
+    NPV = res[["NPV"]][["est"]],  
+    NPV_lower = res[["NPV"]][["lower"]],  
+    NPV_upper = res[["NPV"]][["upper"]],  
+    Sensitivity = res[["Sensitivity"]][["est"]],  
+    Sensitivity_lower = res[["Sensitivity"]][["lower"]],  
+    Sensitivity_upper = res[["Sensitivity"]][["upper"]],  
+    Specificity = res[["Specificity"]][["est"]],  
+    Specificity_lower = res[["Specificity"]][["lower"]],  
+    Specificity_upper = res[["Specificity"]][["upper"]],  
+    stringsAsFactors = FALSE  
+  ))  
+}  
+print(ppv_ci_df_rev_agree)
+write.csv(ppv_ci_df_rev_agree, paste0(project_location, 'tables/metrics_primary_rev_agree.csv'))
+
+boot_results <- lapply(eligible_defs, function(eligible_col) {
+  boot(
+    data = subset(ards_classifier_cohort, sars_cov2_positive==1 | influenza_positive==1),
+    statistic = function(data, index) metrics_fn(data, index, ards_col = "ards_def1", eligible_col = eligible_col),
+    R = 1000
+  )
+})
+names(boot_results) <- readable_labels
+
+for (eligible_def in names(boot_results)) {  
+  boot_obj <- boot_results[[eligible_def]]  
+  metric_ci <- list()  
+  
+  for (i in 1:length(metric_names)) {  
+    # Extract percentile confidence interval for metric i  
+    ci <- boot.ci(boot_obj, type = "perc", index = i)  
+    metric_ci[[metric_names[i]]] <- list(  
+      est = boot_obj$t0[i],  
+      lower = ci$perc[4],  
+      upper = ci$perc[5]  
+    )  
+  }  
+  
+  ci_results[[eligible_def]] <- metric_ci  
+}  
+
+ppv_ci_df_covid_flu <- data.frame(  
+  Classifier = character(0),  
+  PPV = numeric(0),  
+  PPV_lower = numeric(0),  
+  PPV_upper = numeric(0),  
+  NPV = numeric(0),  
+  NPV_lower = numeric(0),  
+  NPV_upper = numeric(0),  
+  Sensitivity = numeric(0),  
+  Sensitivity_lower = numeric(0),  
+  Sensitivity_upper = numeric(0),  
+  Specificity = numeric(0),  
+  Specificity_lower = numeric(0),  
+  Specificity_upper = numeric(0),  
+  stringsAsFactors = FALSE  
+)  
+
+for (eligible_def in names(ci_results)) {  
+  res <- ci_results[[eligible_def]]  
+  ppv_ci_df_covid_flu <- rbind(ppv_ci_df_covid_flu, data.frame(  
+    Classifier = eligible_def,  
+    PPV = res[["PPV"]][["est"]],  
+    PPV_lower = res[["PPV"]][["lower"]],  
+    PPV_upper = res[["PPV"]][["upper"]],  
+    NPV = res[["NPV"]][["est"]],  
+    NPV_lower = res[["NPV"]][["lower"]],  
+    NPV_upper = res[["NPV"]][["upper"]],  
+    Sensitivity = res[["Sensitivity"]][["est"]],  
+    Sensitivity_lower = res[["Sensitivity"]][["lower"]],  
+    Sensitivity_upper = res[["Sensitivity"]][["upper"]],  
+    Specificity = res[["Specificity"]][["est"]],  
+    Specificity_lower = res[["Specificity"]][["lower"]],  
+    Specificity_upper = res[["Specificity"]][["upper"]],  
+    stringsAsFactors = FALSE  
+  ))  
+}  
+print(ppv_ci_df_covid_flu)
+write.csv(ppv_ci_df_covid_flu, paste0(project_location, 'tables/metrics_primary_covid_flu.csv'))
+
+boot_results <- lapply(eligible_defs, function(eligible_col) {
+  boot(
+    data = subset(ards_classifier_cohort, sars_cov2_positive==0 & influenza_positive==0),
+    statistic = function(data, index) metrics_fn(data, index, ards_col = "ards_def1", eligible_col = eligible_col),
+    R = 1000
+  )
+})
+names(boot_results) <- readable_labels
+
+for (eligible_def in names(boot_results)) {  
+  boot_obj <- boot_results[[eligible_def]]  
+  metric_ci <- list()  
+  
+  for (i in 1:length(metric_names)) {  
+    # Extract percentile confidence interval for metric i  
+    ci <- boot.ci(boot_obj, type = "perc", index = i)  
+    metric_ci[[metric_names[i]]] <- list(  
+      est = boot_obj$t0[i],  
+      lower = ci$perc[4],  
+      upper = ci$perc[5]  
+    )  
+  }  
+  
+  ci_results[[eligible_def]] <- metric_ci  
+}  
+
+ppv_ci_df_covid_flu_neg <- data.frame(  
+  Classifier = character(0),  
+  PPV = numeric(0),  
+  PPV_lower = numeric(0),  
+  PPV_upper = numeric(0),  
+  NPV = numeric(0),  
+  NPV_lower = numeric(0),  
+  NPV_upper = numeric(0),  
+  Sensitivity = numeric(0),  
+  Sensitivity_lower = numeric(0),  
+  Sensitivity_upper = numeric(0),  
+  Specificity = numeric(0),  
+  Specificity_lower = numeric(0),  
+  Specificity_upper = numeric(0),  
+  stringsAsFactors = FALSE  
+)  
+
+for (eligible_def in names(ci_results)) {  
+  res <- ci_results[[eligible_def]]  
+  ppv_ci_df_covid_flu_neg <- rbind(ppv_ci_df_covid_flu_neg, data.frame(  
+    Classifier = eligible_def,  
+    PPV = res[["PPV"]][["est"]],  
+    PPV_lower = res[["PPV"]][["lower"]],  
+    PPV_upper = res[["PPV"]][["upper"]],  
+    NPV = res[["NPV"]][["est"]],  
+    NPV_lower = res[["NPV"]][["lower"]],  
+    NPV_upper = res[["NPV"]][["upper"]],  
+    Sensitivity = res[["Sensitivity"]][["est"]],  
+    Sensitivity_lower = res[["Sensitivity"]][["lower"]],  
+    Sensitivity_upper = res[["Sensitivity"]][["upper"]],  
+    Specificity = res[["Specificity"]][["est"]],  
+    Specificity_lower = res[["Specificity"]][["lower"]],  
+    Specificity_upper = res[["Specificity"]][["upper"]],  
+    stringsAsFactors = FALSE  
+  ))  
+}  
+print(ppv_ci_df_covid_flu_neg)
+write.csv(ppv_ci_df_covid_flu_neg, paste0(project_location, 'tables/metrics_primary_covid_flu_neg.csv'))
+
+boot_results <- lapply(eligible_defs, function(eligible_col) {
+  boot(
+    data = subset(ards_classifier_cohort, hospital_id %in% c('JHH', 'BMC')),
+    statistic = function(data, index) metrics_fn(data, index, ards_col = "ards_def1", eligible_col = eligible_col),
+    R = 1000
+  )
+})
+names(boot_results) <- readable_labels
+
+for (eligible_def in names(boot_results)) {  
+  boot_obj <- boot_results[[eligible_def]]  
+  metric_ci <- list()  
+  
+  for (i in 1:length(metric_names)) {  
+    # Extract percentile confidence interval for metric i  
+    ci <- boot.ci(boot_obj, type = "perc", index = i)  
+    metric_ci[[metric_names[i]]] <- list(  
+      est = boot_obj$t0[i],  
+      lower = ci$perc[4],  
+      upper = ci$perc[5]  
+    )  
+  }  
+  
+  ci_results[[eligible_def]] <- metric_ci  
+}  
+
+ppv_ci_df_medICU <- data.frame(  
+  Classifier = character(0),  
+  PPV = numeric(0),  
+  PPV_lower = numeric(0),  
+  PPV_upper = numeric(0),  
+  NPV = numeric(0),  
+  NPV_lower = numeric(0),  
+  NPV_upper = numeric(0),  
+  Sensitivity = numeric(0),  
+  Sensitivity_lower = numeric(0),  
+  Sensitivity_upper = numeric(0),  
+  Specificity = numeric(0),  
+  Specificity_lower = numeric(0),  
+  Specificity_upper = numeric(0),  
+  stringsAsFactors = FALSE  
+)  
+
+for (eligible_def in names(ci_results)) {  
+  res <- ci_results[[eligible_def]]  
+  ppv_ci_df_medICU <- rbind(ppv_ci_df_medICU, data.frame(  
+    Classifier = eligible_def,  
+    PPV = res[["PPV"]][["est"]],  
+    PPV_lower = res[["PPV"]][["lower"]],  
+    PPV_upper = res[["PPV"]][["upper"]],  
+    NPV = res[["NPV"]][["est"]],  
+    NPV_lower = res[["NPV"]][["lower"]],  
+    NPV_upper = res[["NPV"]][["upper"]],  
+    Sensitivity = res[["Sensitivity"]][["est"]],  
+    Sensitivity_lower = res[["Sensitivity"]][["lower"]],  
+    Sensitivity_upper = res[["Sensitivity"]][["upper"]],  
+    Specificity = res[["Specificity"]][["est"]],  
+    Specificity_lower = res[["Specificity"]][["lower"]],  
+    Specificity_upper = res[["Specificity"]][["upper"]],  
+    stringsAsFactors = FALSE  
+  ))  
+}  
+print(ppv_ci_df_medICU)
+write.csv(ppv_ci_df_medICU, paste0(project_location, 'tables/metrics_primary_med_icu.csv'))
+```
+
+```{r Table 1 Where Disgagreement Present}
+
+to_tab <-c(
+  'age_at_admission',
+  'female',
+  'race_ethnicity',
+  'bmi',
+  'elixhauser_count',
+  'academic_hospital',
+  'sars_cov2_positive', 
+  'influenza_positive',
+  'covid',
+  'first_proseva_pf',
+  'sf_ratio_second',
+  'bl_compliance_static',
+  'bl_compliance_dynamic',
+  'compliance_combined',
+  'tv_pbw',
+  'first_proseva_fio2',
+  'first_proseva_peep',
+  'nmb_during_eligibility',
+  'pulmvaso_during_eligibility',
+  'eligible_by_prone',
+  'ecmo_during_eligibility',
+  'ecmo_after_eligibility',
+  'inhosp_death',
+  'dc_hospice',
+  'year'
+)
+
+factors_tab <- c(
+  'female',
+  'race_ethnicity',
+  'academic_hospital',
+  'sars_cov2_positive', 
+  'influenza_positive',
+  'covid',
+  'nmb_during_eligibility',
+  'pulmvaso_during_eligibility',
+  'eligible_by_prone',
+  'ecmo_during_eligibility',
+  'ecmo_after_eligibility',
+  'inhosp_death',
+  'dc_hospice',
+  'year'
+)
+
+nonnorm_tab <- c(
+  'age_at_admission',
+  'bmi',
+  'elixhauser_count',
+  'first_proseva_pf',
+  'sf_ratio_second',
+  'bl_compliance_static',
+  'bl_compliance_dynamic',
+  'compliance_combined',
+  'tv_pbw',
+  'first_proseva_fio2',
+  'first_proseva_peep'
+)
+
+
+tab1 <- CreateTableOne(vars = to_tab, strata="ards_def1", data=subset(ards_classifier_cohort, cohort_eligible_def2==1), factorVars = factors_tab, addOverall = TRUE)
+print(tab1, nonnormal=nonnorm_tab)
+tab1_excel <- print(tab1, nonnorm=nonnorm_tab, printToggle = FALSE)
+write.csv(tab1_excel, file="tables/table1_in_casedisagree.csv")
+rm(tab1_excel)
+
+
+```
+
+
